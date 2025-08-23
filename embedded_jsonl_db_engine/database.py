@@ -10,6 +10,9 @@ from .progress import Progress
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
 from .errors import ValidationError, ConflictError, IOCorruptionError
 
+# Scalar types used for building secondary indexes
+_SCALAR_TYPES = {"str", "int", "float", "bool", "datetime"}
+
 class TDBRecord(dict):
     """
     Dict-like record bound to a specific Database and id (after save()).
@@ -76,6 +79,11 @@ class Database:
         self._progress = Progress(on_progress)
         self._index = InMemoryIndex()
         self._maintenance = maintenance or {}
+        # Precompute index specs from schema hints
+        self._sec_paths: List[str] = []
+        self._rev_list_paths: List[Tuple[str, str]] = []
+        self._rev_single_paths: List[Tuple[str, str]] = []
+        self._compute_index_specs()
         self._open(mode)
 
     def _open(self, mode: str) -> None:
@@ -128,6 +136,17 @@ class Database:
                 ts_ms=ts_ms,
             )
             self._index.add_meta(entry)
+
+        # Build secondary & reverse indexes from live records
+        for rid, ent in self._index.meta.items():
+            if ent.deleted or ent.offset_data is None:
+                continue
+            try:
+                obj_line = self._fs.read_line_at(ent.offset_data)
+                obj = json.loads(obj_line)
+            except Exception:
+                continue
+            self._index_add_from_obj(rid, obj)
 
     def new(self) -> TDBRecord:
         rec: Dict[str, Any] = {}
@@ -300,6 +319,8 @@ class Database:
         for rec in self.find(query):
             if not rec._id:
                 continue
+            # Remove record from secondary/reverse indexes before marking deleted
+            self._index_remove_from_obj(rec._id, rec)
             ts_iso = now_iso()
             meta = {"id": rec._id, "op": "del", "ts": ts_iso}
             off_meta, _ = self._fs.append_meta_data(meta, None)
@@ -313,6 +334,75 @@ class Database:
             self._index.add_meta(entry)
             n += 1
         return n
+
+    # ----- Index helpers -----
+
+    def _compute_index_specs(self) -> None:
+        # Build lists of paths for secondary and reverse indexes based on schema hints
+        self._sec_paths.clear()
+        self._rev_list_paths.clear()
+        self._rev_single_paths.clear()
+        flat = getattr(self._schema, "_flat", {})
+        for path_tuple, fspec in flat.items():
+            path = "/".join(path_tuple)
+            t = getattr(fspec, "type", None)
+            if not path or not t:
+                continue
+            if t in _SCALAR_TYPES and getattr(fspec, "index", False):
+                self._sec_paths.append(path)
+            if t == "list" and getattr(fspec, "index_membership", False) and getattr(fspec, "taxonomy", None):
+                self._rev_list_paths.append((path, getattr(fspec, "taxonomy")))
+            if t in ("str",) and getattr(fspec, "taxonomy", None) and getattr(fspec, "taxonomy_mode", None) == "single":
+                self._rev_single_paths.append((path, getattr(fspec, "taxonomy")))
+
+    def _extract_at_path(self, obj: Dict[str, Any], path: str):
+        cur: Any = obj
+        for key in (p for p in path.split("/") if p):
+            if not isinstance(cur, dict) or key not in cur:
+                return None
+            cur = cur[key]
+        return cur
+
+    def _canonicalize_value(self, v: Any) -> str:
+        return canonical_json(v)
+
+    def _index_add_from_obj(self, rec_id: str, obj: Dict[str, Any]) -> None:
+        # Secondary scalar indexes
+        for path in self._sec_paths:
+            v = self._extract_at_path(obj, path)
+            if isinstance(v, (str, int, float, bool)):
+                self._index.add_secondary(path, self._canonicalize_value(v), rec_id)
+        # Reverse taxonomy for list
+        for path, taxo in self._rev_list_paths:
+            lst = self._extract_at_path(obj, path)
+            if isinstance(lst, list):
+                for item in lst:
+                    if isinstance(item, str):
+                        self._index.add_reverse(taxo, item, rec_id)
+        # Reverse taxonomy for single scalar
+        for path, taxo in self._rev_single_paths:
+            val = self._extract_at_path(obj, path)
+            if isinstance(val, str):
+                self._index.add_reverse(taxo, val, rec_id)
+
+    def _index_remove_from_obj(self, rec_id: str, obj: Dict[str, Any]) -> None:
+        # Secondary scalar indexes
+        for path in self._sec_paths:
+            v = self._extract_at_path(obj, path)
+            if isinstance(v, (str, int, float, bool)):
+                self._index.remove_secondary(path, self._canonicalize_value(v), rec_id)
+        # Reverse taxonomy for list
+        for path, taxo in self._rev_list_paths:
+            lst = self._extract_at_path(obj, path)
+            if isinstance(lst, list):
+                for item in lst:
+                    if isinstance(item, str):
+                        self._index.remove_reverse(taxo, item, rec_id)
+        # Reverse taxonomy for single scalar
+        for path, taxo in self._rev_single_paths:
+            val = self._extract_at_path(obj, path)
+            if isinstance(val, str):
+                self._index.remove_reverse(taxo, val, rec_id)
 
     def taxonomy(self, name: str) -> TaxonomyAPI:
         return TaxonomyAPI(self, name)
@@ -357,6 +447,16 @@ class Database:
         # Full validation
         self._schema.validate(rec)
 
+        # Remove old index entries if any
+        old_entry = self._index.meta.get(rec._id) if rec._id else None
+        if old_entry and not old_entry.deleted and old_entry.offset_data is not None:
+            try:
+                old_line = self._fs.read_line_at(old_entry.offset_data)
+                old_obj = json.loads(old_line)
+                self._index_remove_from_obj(rec._id, old_obj)
+            except Exception:
+                pass
+
         # Serialize and compute meta
         data_str = canonical_json(dict(rec))
         data_bytes = data_str.encode("utf-8")
@@ -381,6 +481,9 @@ class Database:
             ts_ms=iso_to_epoch_ms(ts_iso),
         )
         self._index.add_meta(entry)
+
+        # Update secondary/reverse indexes for new content
+        self._index_add_from_obj(rec._id, rec)
 
         # Sync state
         rec._meta_offset = off_meta
