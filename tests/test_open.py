@@ -1,3 +1,3 @@
 def test_placeholder():
-    # Заглушка, чтобы pytest проходил на пустом каркасе
+    # Placeholder to keep pytest green on initial scaffold
     assert True

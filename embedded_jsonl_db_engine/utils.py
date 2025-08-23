@@ -23,7 +23,7 @@ def canonical_json(obj: Any) -> str:
 def sha256_hex(data: bytes) -> str:
     return sha256(data).hexdigest()
 
-# Упрощённый ULID-подобный id
+# Simplified ULID-like id generator (hex timestamp + random)
 _ALPH = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 def new_ulid() -> str:
     ms = int(time.time() * 1000)

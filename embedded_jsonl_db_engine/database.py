@@ -9,8 +9,8 @@ from .errors import ValidationError, ConflictError
 
 class TDBRecord(dict):
     """
-    dict-подобная запись, связанная с конкретной Database и id (после save()).
-    Контролирует валидацию и отслеживает изменения.
+    Dict-like record bound to a specific Database and id (after save()).
+    Handles validation and tracks changes.
     """
     __slots__ = ("_db", "_id", "_meta_offset", "_orig_hash", "_dirty_fields")
 
@@ -73,7 +73,7 @@ class Database:
 
     def _open(self, mode: str) -> None:
         """
-        Заглушка открытия. Реализация последует после FileStorage.
+        Open stub. Will be implemented after FileStorage primitives are ready.
         """
         raise NotImplementedError("Implement open: lock, read header, scan meta, build indexes.")
 
@@ -132,7 +132,7 @@ class Database:
         raise NotImplementedError("GC orphaned blobs based on references in live records.")
 
     def _validate_assign(self, key: str, value: Any, rec: Dict[str, Any]) -> None:
-        # Полная валидация будет в save(); здесь оставляем минимум.
+        # Full validation will run in save(); keep minimal checks here.
         return
 
     def _record_save(self, rec: TDBRecord, *, force: bool) -> None:

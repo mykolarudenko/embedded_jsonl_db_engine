@@ -9,7 +9,7 @@ META_T   = "meta"
 
 class FileStorage:
     """
-    Каркас низкоуровневого I/O. Реализация будет добавлена на следующем шаге.
+    Low-level I/O scaffold. Implementation will be added in the next step.
     """
     def __init__(self, path: str) -> None:
         self.path = path

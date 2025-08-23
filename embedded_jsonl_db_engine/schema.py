@@ -21,7 +21,7 @@ class FieldSpec:
 
 class Schema:
     """
-    Держит вложенную схему (как в шапке). Валидация и доступ по путям.
+    Holds nested schema (as in file header). Validation and path access.
     """
     def __init__(self, fields: Dict[str, Any]) -> None:
         self._fields = fields
@@ -73,6 +73,7 @@ class Schema:
                 raise SchemaError(f"Unsupported type '{t}' for field '{'/'.join(path+(key,))}'")
 
     def apply_defaults(self, record: Dict[str, Any]) -> None:
+        # Materialize defaults into record in-place
         def walk(spec: Dict[str, Any], obj: Dict[str, Any]) -> None:
             for k, fspec in spec.items():
                 t = fspec["type"]
@@ -94,6 +95,7 @@ class Schema:
         walk({"root": {"type": "object", "fields": self._fields}}, record)
 
     def validate(self, record: Dict[str, Any]) -> None:
+        # Full type/presence validation. Raises ValidationError on mismatch.
         def walk(spec: Dict[str, Any], obj: Dict[str, Any], path: Tuple[str, ...]) -> None:
             for k, fspec in spec.items():
                 t = fspec["type"]

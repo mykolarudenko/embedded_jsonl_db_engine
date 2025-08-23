@@ -12,7 +12,7 @@ class MetaEntry:
 
 class InMemoryIndex:
     """
-    Базовый индекс по meta + вторичные индексы по скалярным полям + обратные индексы для taxonomy multi.
+    Base index for meta + secondary indexes for scalar fields + reverse indexes for taxonomy multi.
     """
     def __init__(self) -> None:
         self.meta: Dict[str, MetaEntry] = {}

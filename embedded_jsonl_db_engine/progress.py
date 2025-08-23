@@ -2,7 +2,7 @@ from typing import Callable, Dict, Optional
 
 class Progress:
     """
-    Лёгкий диспетчер прогресса. Все события проходят через on(event: dict).
+    Lightweight progress dispatcher. All events go through emit(event: dict).
     event = {"phase": str, "pct": int, "msg": str, "bytes_done": int, "bytes_total": int, ...}
     """
     def __init__(self, cb: Optional[Callable[[Dict], None]] = None) -> None:

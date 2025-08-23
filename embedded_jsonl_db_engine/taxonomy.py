@@ -6,9 +6,9 @@ if TYPE_CHECKING:
 
 class TaxonomyAPI:
     """
-    Управление таксономиями, хранящимися в шапке файла.
-    Все изменения требуют немедленной перепаковки файла (бэкап -> миграция -> replace).
-    Реальную миграцию выполняет Database.
+    Manage taxonomies stored in the file header.
+    Structural changes require immediate full-file rewrite (backup -> migration -> replace).
+    Database performs the actual migration.
     """
     def __init__(self, db: "Database", name: str) -> None:
         self._db = db
@@ -25,7 +25,7 @@ class TaxonomyAPI:
         return None
 
     def stats(self) -> List[Dict[str, Any]]:
-        # Используем обратный индекс из db._index
+        # Use reverse index from db._index
         result = []
         for (taxo, key), ids in self._db._index.reverse.items():
             if taxo == self._name:
