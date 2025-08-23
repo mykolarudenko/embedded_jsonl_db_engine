@@ -92,7 +92,7 @@ class Schema:
                         obj[k] = fspec.get("default", [])
                 else:
                     raise SchemaError(f"Unsupported type '{t}'")
-        walk({"root": {"type": "object", "fields": self._fields}}, record)
+        walk(self._fields, record)
 
     def validate(self, record: Dict[str, Any]) -> None:
         # Full type/presence validation. Raises ValidationError on mismatch.
@@ -122,7 +122,7 @@ class Schema:
                             raise ValidationError(f"Field '{'/'.join(p)}' must be list")
                 else:
                     raise SchemaError(f"Unsupported type '{t}' at '{'/'.join(p)}'")
-        walk({"root": {"type": "object", "fields": self._fields}}, record, ())
+        walk(self._fields, record, ())
 
     @staticmethod
     def _validate_scalar(v: Any, t: str, p: Tuple[str, ...]) -> None:
