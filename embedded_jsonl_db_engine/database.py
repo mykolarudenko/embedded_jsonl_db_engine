@@ -200,7 +200,9 @@ class Database:
         try:
             meta_line = self._fs.read_line_at(entry.offset_meta)
             meta_obj = json.loads(meta_line)
-            data_bytes = line.encode("utf-8")
+            # Compare against data without trailing newline
+            data_str_no_nl = line[:-1] if line.endswith("\n") else line
+            data_bytes = data_str_no_nl.encode("utf-8")
             if "len_data" in meta_obj and meta_obj["len_data"] != len(data_bytes):
                 raise IOCorruptionError("data length mismatch at read")
             if "sha256_data" in meta_obj:

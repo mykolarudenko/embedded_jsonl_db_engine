@@ -8,7 +8,7 @@ from typing import Any
 ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 def now_iso() -> str:
-    return datetime.utcnow().replace(tzinfo=timezone.utc).strftime(ISO_FMT)
+    return datetime.now(timezone.utc).strftime(ISO_FMT)
 
 def iso_to_epoch_ms(s: str) -> int:
     dt = datetime.strptime(s, ISO_FMT).replace(tzinfo=timezone.utc)
