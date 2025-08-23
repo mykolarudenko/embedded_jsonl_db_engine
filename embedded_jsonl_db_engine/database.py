@@ -1156,6 +1156,26 @@ class Database:
         """
         self._fs.close()
 
+    def stats(self) -> Dict[str, int]:
+        """
+        Return basic database statistics.
+        """
+        live = 0
+        deleted = 0
+        for e in self._index.meta.values():
+            if e.deleted:
+                deleted += 1
+            elif e.offset_data is not None:
+                live += 1
+        sec_entries = sum(len(s) for s in self._index.secondary.values())
+        rev_entries = sum(len(s) for s in self._index.reverse.values())
+        return {
+            "live": live,
+            "deleted": deleted,
+            "secondary_index_entries": sec_entries,
+            "reverse_index_entries": rev_entries,
+        }
+
     def _validate_taxonomies_strict(self, obj: Dict[str, Any]) -> None:
         """
         Enforce taxonomy constraints for strict fields:
