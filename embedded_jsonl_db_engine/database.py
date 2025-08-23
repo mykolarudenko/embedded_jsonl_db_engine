@@ -11,6 +11,8 @@ from .index import InMemoryIndex, MetaEntry
 from .storage import FileStorage
 from .blobs import BlobManager
 from .progress import Progress
+from .fastregex import compile_path_pattern, extract_first
+from .query import is_simple_query
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
 from .errors import ValidationError, ConflictError, IOCorruptionError
 
@@ -89,6 +91,9 @@ class Database:
         self._rev_list_paths: List[Tuple[str, str]] = []
         self._rev_single_paths: List[Tuple[str, str]] = []
         self._rev_map: Dict[str, str] = {}
+        self._rev_list_strict: Dict[str, bool] = {}
+        self._rev_single_strict: Dict[str, bool] = {}
+        self._scalar_type_map: Dict[str, str] = {}
         self._compute_index_specs()
         self._open(mode)
 
@@ -285,17 +290,123 @@ class Database:
         else:
             items_iter = ((rid, self._index.meta.get(rid)) for rid in cand_ids)
 
+        # Decide if we can use Fast plan (regex extraction) to avoid json.loads on non-matching records
+        use_fast = is_simple_query(query)
+
+        # Extract simple terms (path, op, arg)
+        terms: List[Tuple[str, str, Any]] = []
+        def walk_terms(obj: Dict[str, Any], base: Tuple[str, ...]) -> None:
+            for k, v in obj.items():
+                if k.startswith("$"):
+                    continue
+                new_base = base + (k,)
+                if isinstance(v, dict):
+                    ops = [op for op in v.keys() if isinstance(op, str) and op.startswith("$")]
+                    if ops:
+                        if "$eq" in v:
+                            terms.append(("/".join(new_base), "$eq", v["$eq"]))
+                        if "$ne" in v:
+                            terms.append(("/".join(new_base), "$ne", v["$ne"]))
+                        if "$gt" in v:
+                            terms.append(("/".join(new_base), "$gt", v["$gt"]))
+                        if "$gte" in v:
+                            terms.append(("/".join(new_base), "$gte", v["$gte"]))
+                        if "$lt" in v:
+                            terms.append(("/".join(new_base), "$lt", v["$lt"]))
+                        if "$lte" in v:
+                            terms.append(("/".join(new_base), "$lte", v["$lte"]))
+                    else:
+                        walk_terms(v, new_base)
+                else:
+                    terms.append(("/".join(new_base), "$eq", v))
+        walk_terms(query, ())
+
+        # Build regex patterns if fast is eligible and all paths map to known scalar types
+        pat_map: Dict[str, Any] = {}
+        if use_fast:
+            for path, _op, _arg in terms:
+                tp = self._scalar_type_map.get(path)
+                if tp is None:
+                    use_fast = False
+                    break
+                if path not in pat_map:
+                    pat_map[path] = (tp, compile_path_pattern(path, tp))
+
         recs: List[TDBRecord] = []
         for rec_id, entry in items_iter:
             if not entry or entry.deleted or entry.offset_data is None:
                 continue
             line = self._fs.read_line_at(entry.offset_data)
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if not match_obj(obj, query):
-                continue
+
+            matched = True
+            if use_fast and terms:
+                def parse_val(tp: str, s: Optional[str]):
+                    if s is None:
+                        return None
+                    try:
+                        if tp == "str" or tp == "datetime":
+                            return json.loads(s)
+                        if tp == "int":
+                            return int(s)
+                        if tp == "float":
+                            return float(s)
+                        if tp == "bool":
+                            return True if s == "true" else False
+                    except Exception:
+                        return None
+                    return None
+                def cmp(op: str, val, arg) -> bool:
+                    try:
+                        if op == "$eq":  return val == arg
+                        if op == "$ne":  return val != arg
+                        if op == "$gt":  return val > arg
+                        if op == "$gte": return val >= arg
+                        if op == "$lt":  return val < arg
+                        if op == "$lte": return val <= arg
+                        return False
+                    except Exception:
+                        return False
+                for path, op, arg in terms:
+                    tp, pat = pat_map[path]
+                    raw = extract_first(pat, line)
+                    val = parse_val(tp, raw)
+                    # Normalize arg to same type
+                    try:
+                        if tp == "int" and not isinstance(arg, int):
+                            arg = int(arg)
+                        elif tp == "float" and not isinstance(arg, (int, float)):
+                            arg = float(arg)
+                        elif tp in ("str", "datetime") and not isinstance(arg, str):
+                            arg = str(arg)
+                        elif tp == "bool" and not isinstance(arg, bool):
+                            if isinstance(arg, str):
+                                arg = (arg.lower() == "true")
+                            else:
+                                arg = bool(arg)
+                    except Exception:
+                        matched = False
+                        break
+                    if val is None and op not in ("$ne",):
+                        matched = False
+                        break
+                    if not cmp(op, val, arg):
+                        matched = False
+                        break
+                if not matched:
+                    continue
+                # For matched fast-path records, materialize object for result/ordering/projection
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+            else:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not match_obj(obj, query):
+                    continue
+
             rec = TDBRecord(self, obj)
             rec._id = rec_id
             rec._meta_offset = entry.offset_meta
@@ -434,22 +545,29 @@ class Database:
         self._rev_list_paths.clear()
         self._rev_single_paths.clear()
         self._rev_map.clear()
+        self._rev_list_strict.clear()
+        self._rev_single_strict.clear()
+        self._scalar_type_map.clear()
         flat = getattr(self._schema, "_flat", {})
         for path_tuple, fspec in flat.items():
             path = "/".join(path_tuple)
             t = getattr(fspec, "type", None)
             if not path or not t:
                 continue
-            if t in _SCALAR_TYPES and getattr(fspec, "index", False):
-                self._sec_paths.append(path)
+            if t in _SCALAR_TYPES:
+                self._scalar_type_map[path] = t
+                if getattr(fspec, "index", False):
+                    self._sec_paths.append(path)
             if t == "list" and getattr(fspec, "index_membership", False) and getattr(fspec, "taxonomy", None):
                 taxo = getattr(fspec, "taxonomy")
                 self._rev_list_paths.append((path, taxo))
                 self._rev_map[path] = taxo
+                self._rev_list_strict[path] = bool(getattr(fspec, "strict", False))
             if t in ("str",) and getattr(fspec, "taxonomy", None) and getattr(fspec, "taxonomy_mode", None) == "single":
                 taxo = getattr(fspec, "taxonomy")
                 self._rev_single_paths.append((path, taxo))
                 self._rev_map[path] = taxo
+                self._rev_single_strict[path] = bool(getattr(fspec, "strict", False))
 
     def _extract_at_path(self, obj: Dict[str, Any], path: str):
         cur: Any = obj
@@ -913,6 +1031,54 @@ class Database:
         removed, freed = mgr.gc(used)
         return {"files_removed": removed, "bytes_freed": freed}
 
+    def _validate_taxonomies_strict(self, obj: Dict[str, Any]) -> None:
+        """
+        Enforce taxonomy constraints for strict fields:
+        - list[str] taxonomy with strict=True: all items must exist in taxonomy list
+        - single str taxonomy with strict=True: value must exist in taxonomy list
+        Also validates item types (list elements are strings).
+        """
+        # Build allowed sets lazily
+        allowed_cache: Dict[str, Set[str]] = {}
+
+        def allowed_keys(taxo: str) -> Set[str]:
+            if taxo not in allowed_cache:
+                items = self._taxonomies.get(taxo, {}).get("list", [])
+                keys = {it.get("key") for it in items if isinstance(it, dict) and "key" in it}
+                allowed_cache[taxo] = {k for k in keys if isinstance(k, str)}
+            return allowed_cache[taxo]
+
+        # list[str] strict
+        for path, taxo in self._rev_list_paths:
+            strict = self._rev_list_strict.get(path, False)
+            if not strict:
+                continue
+            v = self._extract_at_path(obj, path)
+            if v is None:
+                continue
+            if not isinstance(v, list):
+                raise ValidationError(f"taxonomy list path '{path}' must be list[str]")
+            allow = allowed_keys(taxo)
+            for item in v:
+                if not isinstance(item, str):
+                    raise ValidationError(f"taxonomy list path '{path}' must contain strings")
+                if item not in allow:
+                    raise ValidationError(f"unknown taxonomy key '{item}' for '{taxo}' at '{path}'")
+
+        # single str strict
+        for path, taxo in self._rev_single_paths:
+            strict = self._rev_single_strict.get(path, False)
+            if not strict:
+                continue
+            v = self._extract_at_path(obj, path)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                raise ValidationError(f"taxonomy single path '{path}' must be string")
+            allow = allowed_keys(taxo)
+            if v not in allow:
+                raise ValidationError(f"unknown taxonomy key '{v}' for '{taxo}' at '{path}'")
+
     def _validate_assign(self, key: str, value: Any, rec: Dict[str, Any]) -> None:
         # Full validation will run in save(); keep minimal checks here.
         return
@@ -929,8 +1095,16 @@ class Database:
         if not force and not rec.dirty:
             return
 
+        # Optimistic concurrency: ensure we save over the latest version
+        if rec._id is not None and rec._meta_offset is not None:
+            cur = self._index.meta.get(rec._id)
+            if cur and cur.offset_meta != rec._meta_offset:
+                raise ConflictError("record was modified by another operation")
+
         # Full validation
         self._schema.validate(rec)
+        # Enforce taxonomy strictness (if enabled in schema)
+        self._validate_taxonomies_strict(rec)
 
         # Remove old index entries if any
         old_entry = self._index.meta.get(rec._id) if rec._id else None
