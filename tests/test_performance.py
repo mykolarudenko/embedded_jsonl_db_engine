@@ -79,7 +79,7 @@ def test_performance_big_dataset(tmp_path):
 
     # Update all records (empty query matches all)
     t10 = time.perf_counter()
-    updated = db2.update({}, {"f01": "updated"})
+    updated = db2.update({}, {"f01": 999})
     t11 = time.perf_counter()
     print(f"[perf] update all {updated} records: {(t11 - t10):.3f}s")
 
