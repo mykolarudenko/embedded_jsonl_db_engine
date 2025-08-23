@@ -24,7 +24,7 @@ class TDBRecord(dict):
     Dict-like record bound to a specific Database and id (after save()).
     Handles validation and tracks changes.
     """
-    __slots__ = ("_db", "_id", "_meta_offset", "_orig_hash", "_dirty_fields")
+    __slots__ = ("_db", "_id", "_meta_offset", "_orig_hash", "_dirty_fields", "_meta")
 
     def __init__(self, db: "Database", initial: Dict[str, Any]) -> None:
         super().__init__(initial)
@@ -33,6 +33,7 @@ class TDBRecord(dict):
         self._meta_offset: Optional[int] = None
         self._orig_hash = self._hash_data()
         self._dirty_fields: set[str] = set()
+        self._meta: Optional[Dict[str, Any]] = None
 
     def _hash_data(self) -> str:
         # Canonical JSON string is enough for dirty detection (sha256 not required here)
@@ -41,6 +42,10 @@ class TDBRecord(dict):
     @property
     def id(self) -> Optional[str]:
         return self._id
+
+    @property
+    def meta(self) -> Optional[Dict[str, Any]]:
+        return getattr(self, "_meta", None)
 
     @property
     def dirty(self) -> bool:
@@ -187,6 +192,7 @@ class Database:
         except Exception:
             return None
         # Optional integrity check against meta
+        meta_obj = None
         try:
             meta_line = self._fs.read_line_at(entry.offset_meta)
             meta_obj = json.loads(meta_line)
@@ -204,6 +210,8 @@ class Database:
         rec._meta_offset = entry.offset_meta
         rec._orig_hash = rec._hash_data()
         rec._dirty_fields.clear()
+        if include_meta:
+            rec._meta = meta_obj if isinstance(meta_obj, dict) else None
         return rec
 
     def find(
@@ -222,7 +230,7 @@ class Database:
         # - simple ops: $eq/$ne/$gt/$gte/$lt/$lte
         # - $contains for list[str] or substring for str
         def is_op_key(k: str) -> bool:
-            return k in ("$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$contains")
+            return k in ("$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$contains", "$in", "$nin")
 
         def match_obj(obj: Dict[str, Any], q: Dict[str, Any]) -> bool:
             for k, v in q.items():
@@ -261,6 +269,24 @@ class Database:
                                     return False
                             except Exception:
                                 return False
+                        elif op == "$in":
+                            if not isinstance(arg, list):
+                                return False
+                            if isinstance(val, list):
+                                if not any(x in arg for x in val):
+                                    return False
+                            else:
+                                if val not in arg:
+                                    return False
+                        elif op == "$nin":
+                            if not isinstance(arg, list):
+                                return False
+                            if isinstance(val, list):
+                                if any(x in arg for x in val):
+                                    return False
+                            else:
+                                if val in arg:
+                                    return False
                         elif op == "$contains":
                             if isinstance(val, list):
                                 if arg not in val:
@@ -427,9 +453,13 @@ class Database:
                     return ("2", json.dumps(v, sort_keys=True, ensure_ascii=False))
                 except Exception:
                     return ("2", str(v))
+            def get_by_path(r: Dict[str, Any], p: str):
+                if "/" in p:
+                    return self._extract_at_path(r, p)
+                return r.get(p)
             for field, direction in reversed(order_by):
                 reverse = (str(direction).lower() == "desc")
-                recs.sort(key=lambda r: norm(r.get(field)), reverse=reverse)
+                recs.sort(key=lambda r: norm(get_by_path(r, field)), reverse=reverse)
 
         # Skip / limit
         start = max(0, int(skip)) if isinstance(skip, int) else 0
