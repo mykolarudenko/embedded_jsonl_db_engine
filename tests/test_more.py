@@ -129,12 +129,19 @@ def test_taxonomy_merge_and_delete(tmp_path):
     tx.upsert("target")
 
     # Insert records referencing a and b
-    r1 = db.new(); r1["name"] = "A"; r1["categories"] = ["a"]; r1.save()
-    r2 = db.new(); r2["name"] = "B"; r2["categories"] = ["b"]; r2.save()
+    r1 = db.new()
+    r1["name"] = "A"
+    r1["categories"] = ["a"]
+    r1.save()
+    r2 = db.new()
+    r2["name"] = "B"
+    r2["categories"] = ["b"]
+    r2.save()
 
     # Merge a,b -> target
     tx.merge(["a", "b"], "target")
-    g1 = db.get(r1.id); g2 = db.get(r2.id)
+    g1 = db.get(r1.id)
+    g2 = db.get(r2.id)
     assert g1 is not None and g2 is not None
     assert "target" in g1.get("categories", []) and "a" not in g1.get("categories", [])
     assert "target" in g2.get("categories", []) and "b" not in g2.get("categories", [])
@@ -170,8 +177,12 @@ def test_stats(tmp_path):
     db_path = tmp_path / "stats.jsonl"
     db = Database(str(db_path), schema=make_schema())
 
-    r1 = db.new(); r1["name"] = "A"; r1.save()
-    r2 = db.new(); r2["name"] = "B"; r2.save()
+    r1 = db.new()
+    r1["name"] = "A"
+    r1.save()
+    r2 = db.new()
+    r2["name"] = "B"
+    r2.save()
     db.delete({"id": r1.id})
 
     st = db.stats()
