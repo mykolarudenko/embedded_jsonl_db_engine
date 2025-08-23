@@ -5,7 +5,7 @@ SIMPLE_OPS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte"}
 
 def is_simple_query(q: Dict[str, Any], max_terms: int = 3) -> bool:
     """
-    Проверяет, что запрос состоит из <= max_terms простых скалярных предикатов без $or/$in/$regex/etc.
+    Check that the query contains <= max_terms simple scalar predicates without $or/$in/$regex/etc.
     """
     terms = 0
     def visit(obj: Any) -> bool:

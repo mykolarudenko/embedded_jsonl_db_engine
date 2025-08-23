@@ -27,5 +27,5 @@ def sha256_hex(data: bytes) -> str:
 _ALPH = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 def new_ulid() -> str:
     ms = int(time.time() * 1000)
-    rand = int.from_bytes(os.urandom(10), "big")  # 80 бит
+    rand = int.from_bytes(os.urandom(10), "big")  # 80 bits
     return f"{ms:012x}{rand:020x}"
