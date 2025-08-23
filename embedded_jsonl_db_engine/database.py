@@ -14,7 +14,7 @@ from .progress import Progress
 from .fastregex import compile_path_pattern, extract_first
 from .query import is_simple_query
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
-from .errors import ValidationError, ConflictError, IOCorruptionError
+from .errors import ValidationError, ConflictError, IOCorruptionError, DuplicateIdError
 
 # Scalar types used for building secondary indexes
 _SCALAR_TYPES = {"str", "int", "float", "bool", "datetime"}
@@ -1141,13 +1141,21 @@ class Database:
         return
 
     def _record_save(self, rec: TDBRecord, *, force: bool) -> None:
-        # Assign id/createdAt on new records
+        # Assign/align id and createdAt on new records
         if rec._id is None:
-            rec._id = new_ulid()
-            if "id" not in rec:
+            # If user pre-filled "id" field, respect it; otherwise generate new ULID
+            pre_id = rec.get("id")
+            if isinstance(pre_id, str) and pre_id:
+                rec._id = pre_id
+            else:
+                rec._id = new_ulid()
                 rec["id"] = rec._id
             if "createdAt" not in rec:
                 rec["createdAt"] = now_iso()
+        else:
+            # Ensure the data field "id" matches internal _id
+            if rec.get("id") != rec._id:
+                rec["id"] = rec._id
 
         if not force and not rec.dirty:
             return
@@ -1157,6 +1165,11 @@ class Database:
             cur = self._index.meta.get(rec._id)
             if cur and cur.offset_meta != rec._meta_offset:
                 raise ConflictError("record was modified by another operation")
+
+        # Duplicate id guard on first insert
+        existing = self._index.meta.get(rec._id) if rec._id is not None else None
+        if rec._meta_offset is None and existing and not existing.deleted:
+            raise DuplicateIdError(f"record with id '{rec._id}' already exists")
 
         # Full validation
         self._schema.validate(rec)
