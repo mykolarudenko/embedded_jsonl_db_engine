@@ -132,12 +132,16 @@ class Database:
             self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
             self._compute_index_specs()
 
-        # Rebuild in-memory index from meta stream
+        # Rebuild in-memory index from meta stream (streaming, no full list to reduce memory)
         self._index = InMemoryIndex()
-        meta_lines = list(self._fs.iter_meta_offsets())
-        total = len(meta_lines)
-        self._progress.emit("open.scan_meta", 0, total=total)
-        for i, (offset, line) in enumerate(meta_lines, 1):
+        try:
+            total_bytes = os.path.getsize(self.path)
+        except Exception:
+            total_bytes = 0
+        scanned = 0
+        last_pct = -1
+        for offset, line in self._fs.iter_meta_offsets():
+            scanned += 1
             try:
                 meta = json.loads(line)
             except Exception:
@@ -162,7 +166,12 @@ class Database:
                 ts_ms=ts_ms,
             )
             self._index.add_meta(entry)
-            self._progress.emit("open.scan_meta", int(i * 100 / max(1, total)), scanned=i, total=total)
+            if total_bytes:
+                pct = min(99, int((offset * 100) / max(1, total_bytes)))
+                if last_pct == -1 or pct - last_pct >= 5 or pct == 99:
+                    self._progress.emit("open.scan_meta", pct, scanned=scanned, bytes_done=offset, bytes_total=total_bytes)
+                    last_pct = pct
+        self._progress.emit("open.scan_meta", 100, scanned=scanned)
 
         # Build secondary & reverse indexes from live records
         self._progress.emit("open.build_indexes", 0, total=len(self._index.meta))
@@ -497,10 +506,14 @@ class Database:
 
     def update(self, query: Dict[str, Any], patch: Dict[str, Any]) -> int:
         n = 0
+        self._progress.emit("update.start", 0)
         for rec in self.find(query):
             self._deep_update(rec, patch)
             rec.save()
             n += 1
+            if n % 100 == 0:
+                self._progress.emit("update.run", 0, updated=n)
+        self._progress.emit("update.done", 100, updated=n)
         return n
 
     def delete(self, query: Dict[str, Any]) -> int:
@@ -508,6 +521,7 @@ class Database:
         Logical deletion: append meta(op:"del") for matched records and update index.
         """
         n = 0
+        self._progress.emit("delete.start", 0)
         for rec in self.find(query):
             if not rec._id:
                 continue
@@ -525,6 +539,9 @@ class Database:
             )
             self._index.add_meta(entry)
             n += 1
+            if n % 100 == 0:
+                self._progress.emit("delete.run", 0, deleted=n)
+        self._progress.emit("delete.done", 100, deleted=n)
         return n
 
     # ----- Index helpers -----
@@ -940,29 +957,35 @@ class Database:
                 s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
                 dst.write(s + "\n")
 
-            # Copy live records in ts order
-            live_entries_sorted = sorted(live_entries, key=lambda e: e.ts_ms)
+            # Copy live records in file order to minimize seeks. No JSON parse.
+            live_entries_sorted = sorted(live_entries, key=lambda e: (e.offset_data or 0))
             total = len(live_entries_sorted)
-            for i, e in enumerate(live_entries_sorted, 1):
-                line = self._fs.read_line_at(e.offset_data)
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                data_str = canonical_json(obj)
-                data_bytes = data_str.encode("utf-8")
-                ts_iso = now_iso()
-                meta_obj = {
-                    "_t": "meta",
-                    "id": e.id,
-                    "op": "put",
-                    "ts": ts_iso,
-                    "len_data": len(data_bytes),
-                    "sha256_data": sha256_hex(data_bytes),
-                }
-                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-                dst.write(data_str + "\n")
-                self._progress.emit("compact.copy", int(i * 100 / max(1, total)), copied=i, total=total)
+            with open(self.path, "rb") as src:
+                for i, e in enumerate(live_entries_sorted, 1):
+                    if e.offset_data is None:
+                        continue
+                    src.seek(e.offset_data)
+                    line_bytes = src.readline()
+                    try:
+                        data_str = line_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        # Replace invalid bytes to keep compaction robust
+                        data_str = line_bytes.decode("utf-8", errors="replace")
+                    # Remove trailing newline for len/hash calculation
+                    data_str_no_nl = data_str[:-1] if data_str.endswith("\n") else data_str
+                    data_bytes = data_str_no_nl.encode("utf-8")
+                    ts_iso = now_iso()
+                    meta_obj = {
+                        "_t": "meta",
+                        "id": e.id,
+                        "op": "put",
+                        "ts": ts_iso,
+                        "len_data": len(data_bytes),
+                        "sha256_data": sha256_hex(data_bytes),
+                    }
+                    dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    dst.write(data_str_no_nl + "\n")
+                    self._progress.emit("compact.copy", int(i * 100 / max(1, total)), copied=i, total=total)
 
             dst.flush()
             try:
