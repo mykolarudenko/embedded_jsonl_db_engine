@@ -26,5 +26,16 @@ Development bootstrap
   3) Implement minimal CRUD: new/get/save/find(delete as a stub if needed).
   4) Add simple tests for open/new/save/get.
 
+What has been implemented so far
+- Package scaffold with all core modules and clear NotImplementedError stubs for heavy logic.
+- English comments and docstrings across the codebase.
+- TYPE_CHECKING import in taxonomy to avoid runtime circular imports.
+- Query helper is_simple_query() for fast-plan eligibility.
+- Fast regex path compiler scaffold (compile_path_pattern, extract_first).
+- Utils for ISO timestamps, epoch conversions, canonical JSON, sha256, and ULID-like ids.
+- In-memory index structures (MetaEntry, InMemoryIndex) for meta/secondary/reverse indexes.
+- Database/TDBRecord skeleton with validation hooks and change tracking.
+- FileStorage scaffold with constants and method signatures for low-level I/O.
+
 License
 MIT
