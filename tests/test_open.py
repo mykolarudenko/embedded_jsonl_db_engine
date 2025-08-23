@@ -19,6 +19,9 @@ def test_crud_index_backup_compact(tmp_path):
     db_path = tmp_path / "users.jsonl"
     db = Database(str(db_path), schema=make_schema())
 
+    # Ensure taxonomy keys exist for strict validation
+    db.taxonomy("categories").upsert("fitness", title="Fitness")
+
     # Create and save a record
     r = db.new()
     r["name"] = "Alice"
@@ -71,7 +74,19 @@ def test_taxonomy_header_update(tmp_path):
     lst = tx.list()
     assert any(item.get("key") == "fitness" for item in lst)
 
+    # Create a record that references the taxonomy key to verify migration
+    r = db.new()
+    r["name"] = "Bob"
+    r["categories"] = ["fitness"]
+    r.save()
+    rid = r.id
+
     # Rename taxonomy key (full-file migration)
     tx.rename("fitness", "health_and_fitness")
     lst2 = tx.list()
     assert any(item.get("key") == "health_and_fitness" for item in lst2)
+
+    # Ensure the record was migrated to the new taxonomy key
+    r_after = db.get(rid)
+    assert r_after is not None
+    assert "health_and_fitness" in r_after.get("categories", [])
