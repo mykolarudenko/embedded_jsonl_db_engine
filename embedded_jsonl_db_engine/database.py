@@ -79,6 +79,7 @@ class Database:
         self._progress = Progress(on_progress)
         self._index = InMemoryIndex()
         self._maintenance = maintenance or {}
+        self._header: Dict[str, Any] = {}
         # Precompute index specs from schema hints
         self._sec_paths: List[str] = []
         self._rev_list_paths: List[Tuple[str, str]] = []
@@ -98,6 +99,7 @@ class Database:
         try:
             _hdr, _schema_fields, taxonomies = self._fs.read_header_and_schema()
             # Keep taxonomies from file (schema migration is out of scope here)
+            self._header = _hdr
             self._taxonomies = taxonomies or {}
         except IOCorruptionError:
             # Initialize a new file
@@ -107,6 +109,7 @@ class Database:
                 "created": now_iso(),
                 "defaults_always_materialized": True,
             }
+            self._header = hdr
             self._taxonomies = {}
             self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
 
@@ -475,7 +478,53 @@ class Database:
         return TaxonomyAPI(self, name)
 
     def _taxonomy_header_update(self, name: str, *, op: str, key: str, attrs: Dict[str, Any]) -> None:
-        raise NotImplementedError("Rewrite header with updated taxonomies, do rolling backup.")
+        """
+        Update taxonomy metadata in header only (no data migration). Rewrites header and rebuilds indexes.
+        Supported ops: "upsert", "set_attrs".
+        """
+        if not name or not isinstance(name, str):
+            raise ValidationError("taxonomy name must be non-empty string")
+        if not key or not isinstance(key, str):
+            raise ValidationError("taxonomy key must be non-empty string")
+        taxo = self._taxonomies.setdefault(name, {"list": []})
+        items = taxo.get("list")
+        if not isinstance(items, list):
+            items = []
+            taxo["list"] = items
+
+        idx = None
+        for i, item in enumerate(items):
+            if isinstance(item, dict) and item.get("key") == key:
+                idx = i
+                break
+
+        if op == "upsert":
+            if idx is not None:
+                # merge attrs into existing
+                cur = dict(items[idx])
+                cur.update(attrs or {})
+                cur["key"] = key
+                items[idx] = cur
+            else:
+                new_item = {"key": key}
+                if attrs:
+                    new_item.update(attrs)
+                items.append(new_item)
+        elif op == "set_attrs":
+            if idx is None:
+                raise ValidationError("taxonomy key not found for set_attrs")
+            cur = dict(items[idx])
+            cur.update(attrs or {})
+            cur["key"] = key
+            items[idx] = cur
+        else:
+            raise ValidationError(f"unsupported taxonomy header op: {op!r}")
+
+        # Rewrite header safely (close handle to avoid appending to unlinked inode)
+        self._fs.close()
+        self._fs.rewrite_header(self._header, self._schema._fields, self._taxonomies)
+        # Reopen and rebuild indexes (offsets changed after header rewrite)
+        self._open("+")
 
     def _taxonomy_migrate(self, name: str, **kwargs: Any) -> None:
         raise NotImplementedError("Full-file migration for taxonomy changes with progress and backup.")

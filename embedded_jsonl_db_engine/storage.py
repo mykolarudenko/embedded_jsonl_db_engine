@@ -132,6 +132,31 @@ class FileStorage:
             # Not all FS support fsync on text handles; ignore for now
             pass
 
+    def rewrite_header(self, header: Dict, schema: Dict, taxonomies: Dict) -> None:
+        """
+        Rewrite only the 4-line header by creating a temporary file, copying data, and atomically replacing.
+        """
+        tmp_path = self.path + ".tmp"
+        with open(self.path, "rb") as src, open(tmp_path, "wb") as dst:
+            # Write new header lines
+            for obj in ({"_t": HEADER_T, **header},
+                        {"_t": SCHEMA_T, "fields": schema},
+                        {"_t": TAXO_T, "items": taxonomies},
+                        {"_t": BEGIN_T}):
+                s = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                dst.write(s + b"\n")
+            # Skip 4 existing header lines
+            for _ in range(4):
+                if src.readline() == b"":
+                    break
+            # Copy remainder
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        self.replace_file(tmp_path)
+
     # ----- Append / read meta+data -----
 
     def append_meta_data(self, meta: Dict, data_str: str | None) -> Tuple[int, int | None]:
