@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import json
+import io
 import gzip
 import shutil
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
@@ -8,6 +9,7 @@ from .schema import Schema
 from .taxonomy import TaxonomyAPI
 from .index import InMemoryIndex, MetaEntry
 from .storage import FileStorage
+from .blobs import BlobManager
 from .progress import Progress
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
 from .errors import ValidationError, ConflictError, IOCorruptionError
@@ -476,6 +478,65 @@ class Database:
             if isinstance(val, str):
                 self._index.remove_reverse(taxo, val, rec_id)
 
+    def _set_at_path(self, obj: Dict[str, Any], path: str, value: Any) -> bool:
+        cur: Any = obj
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return False
+        for key in parts[:-1]:
+            if not isinstance(cur, dict) or key not in cur:
+                return False
+            cur = cur[key]
+        if not isinstance(cur, dict):
+            return False
+        cur[parts[-1]] = value
+        return True
+
+    def _delete_at_path(self, obj: Dict[str, Any], path: str) -> bool:
+        cur: Any = obj
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return False
+        for key in parts[:-1]:
+            if not isinstance(cur, dict) or key not in cur:
+                return False
+            cur = cur[key]
+        if isinstance(cur, dict) and parts[-1] in cur:
+            del cur[parts[-1]]
+            return True
+        return False
+
+    def _transform_taxonomy_in_obj(self, obj: Dict[str, Any], *, list_paths: List[str], scalar_paths: List[str], mapping: Dict[str, Optional[str]]) -> None:
+        # Transform list[str] taxonomy memberships
+        for path in list_paths:
+            v = self._extract_at_path(obj, path)
+            if isinstance(v, list):
+                new_list: List[str] = []
+                seen = set()
+                changed = False
+                for item in v:
+                    if isinstance(item, str):
+                        if item in mapping:
+                            new_item = mapping[item]
+                            changed = True
+                            if new_item is None:
+                                continue
+                            item = new_item
+                    if isinstance(item, str) and item not in seen:
+                        seen.add(item)
+                        new_list.append(item)
+                if changed:
+                    self._set_at_path(obj, path, new_list)
+        # Transform single string taxonomy refs
+        for path in scalar_paths:
+            v = self._extract_at_path(obj, path)
+            if isinstance(v, str) and v in mapping:
+                new_val = mapping[v]
+                if new_val is None:
+                    self._delete_at_path(obj, path)
+                else:
+                    self._set_at_path(obj, path, new_val)
+
     def taxonomy(self, name: str) -> TaxonomyAPI:
         return TaxonomyAPI(self, name)
 
@@ -529,7 +590,121 @@ class Database:
         self._open("+")
 
     def _taxonomy_migrate(self, name: str, **kwargs: Any) -> None:
-        raise NotImplementedError("Full-file migration for taxonomy changes with progress and backup.")
+        """
+        Perform full-file rewrite to apply taxonomy key changes across records.
+        Supported actions:
+          - action="rename", old_key, new_key, collision="merge"
+          - action="merge", source_keys: List[str], target_key: str
+          - action="delete", key: str, strategy="detach"
+        """
+        action = kwargs.get("action")
+        if action not in ("rename", "merge", "delete"):
+            raise ValidationError("unsupported taxonomy migration action")
+
+        taxo = self._taxonomies.setdefault(name, {"list": []})
+        items = taxo.get("list") or []
+        if not isinstance(items, list):
+            items = []
+        items_by_key = {item.get("key"): dict(item) for item in items if isinstance(item, dict) and "key" in item}
+
+        mapping: Dict[str, Optional[str]] = {}
+
+        if action == "rename":
+            old_key = kwargs.get("old_key")
+            new_key = kwargs.get("new_key")
+            collision = kwargs.get("collision", "merge")
+            if not old_key or not new_key:
+                raise ValidationError("rename requires old_key and new_key")
+            mapping[old_key] = new_key
+            if collision != "merge" and new_key in items_by_key and old_key in items_by_key:
+                raise ValidationError("rename collision not supported other than 'merge'")
+            if old_key in items_by_key:
+                src = items_by_key.pop(old_key)
+                if new_key not in items_by_key:
+                    src["key"] = new_key
+                    items_by_key[new_key] = src
+
+        elif action == "merge":
+            source_keys = kwargs.get("source_keys") or []
+            target_key = kwargs.get("target_key")
+            if not isinstance(source_keys, list) or not target_key:
+                raise ValidationError("merge requires source_keys list and target_key")
+            for sk in source_keys:
+                if sk == target_key:
+                    continue
+                mapping[sk] = target_key
+            if target_key not in items_by_key:
+                items_by_key[target_key] = {"key": target_key}
+            for sk in source_keys:
+                items_by_key.pop(sk, None)
+
+        elif action == "delete":
+            key = kwargs.get("key")
+            strategy = kwargs.get("strategy", "detach")
+            if not key:
+                raise ValidationError("delete requires key")
+            if strategy != "detach":
+                raise ValidationError("only 'detach' delete strategy is supported")
+            mapping[key] = None
+            items_by_key.pop(key, None)
+
+        # Update in-memory taxonomies and write migrated file
+        new_items = list(items_by_key.values())
+        self._taxonomies[name] = {"list": new_items}
+
+        # Determine schema paths referencing this taxonomy
+        list_paths = [p for (p, t) in self._rev_list_paths if t == name]
+        scalar_paths = [p for (p, t) in self._rev_single_paths if t == name]
+
+        # Close handle, then rewrite file
+        self._fs.close()
+
+        tmp_path = f"{self.path}.migrate.tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+            # Write header with updated taxonomies
+            header_lines = [
+                {"_t": "header", **self._header},
+                {"_t": "schema", "fields": self._schema._fields},
+                {"_t": "taxonomies", "items": self._taxonomies},
+                {"_t": "begin"},
+            ]
+            for obj in header_lines:
+                dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+            # Copy and transform live records by ts order
+            live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
+            live_entries.sort(key=lambda e: e.ts_ms)
+            total = len(live_entries)
+            for i, e in enumerate(live_entries, 1):
+                line = self._fs.read_line_at(e.offset_data)
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                self._transform_taxonomy_in_obj(obj, list_paths=list_paths, scalar_paths=scalar_paths, mapping=mapping)
+                data_str = canonical_json(obj)
+                data_bytes = data_str.encode("utf-8")
+                ts_iso = now_iso()
+                meta_obj = {
+                    "_t": "meta",
+                    "id": e.id,
+                    "op": "put",
+                    "ts": ts_iso,
+                    "len_data": len(data_bytes),
+                    "sha256_data": sha256_hex(data_bytes),
+                }
+                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                dst.write(data_str + "\n")
+                self._progress.emit("taxonomy.migrate", int(i * 100 / max(1, total)), key=name, action=action)
+
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except Exception:
+                pass
+
+        self._fs.replace_file(tmp_path)
+        self._open("+")
 
     def compact_now(self) -> None:
         """
@@ -667,13 +842,54 @@ class Database:
         self._fs.open_exclusive("+")
 
     def put_blob(self, stream_or_bytes, *, mime: str, filename: str | None = None) -> Dict[str, Any]:
-        raise NotImplementedError("Delegate to BlobManager and return ref dict.")
+        """
+        Store a BLOB in external CAS and return a reference dict.
+        Accepts bytes or a binary file-like object.
+        """
+        mgr = BlobManager(self.path)
+        if isinstance(stream_or_bytes, (bytes, bytearray)):
+            bio = io.BytesIO(stream_or_bytes)
+            return mgr.put_blob(bio, mime, filename)
+        if hasattr(stream_or_bytes, "read"):
+            return mgr.put_blob(stream_or_bytes, mime, filename)
+        raise ValidationError("put_blob expects bytes or a binary stream")
 
     def open_blob(self, ref: Dict[str, Any]):
-        raise NotImplementedError("Delegate to BlobManager and return file-like.")
+        """
+        Open blob by reference for reading.
+        """
+        mgr = BlobManager(self.path)
+        return mgr.open_blob(ref)
 
     def gc_blobs(self) -> Dict[str, int]:
-        raise NotImplementedError("GC orphaned blobs based on references in live records.")
+        """
+        Garbage-collect orphaned blobs based on references in live records.
+        """
+        # Collect referenced hashes from all live records
+        def collect(obj, out: Set[str]) -> None:
+            if isinstance(obj, dict):
+                if "$blob" in obj and isinstance(obj.get("$blob"), str) and obj["$blob"].startswith("sha256:"):
+                    out.add(obj["$blob"].split("sha256:", 1)[1])
+                for v in obj.values():
+                    collect(v, out)
+            elif isinstance(obj, list):
+                for it in obj:
+                    collect(it, out)
+
+        used: Set[str] = set()
+        for e in self._index.meta.values():
+            if e.deleted or e.offset_data is None:
+                continue
+            try:
+                line = self._fs.read_line_at(e.offset_data)
+                obj = json.loads(line)
+            except Exception:
+                continue
+            collect(obj, used)
+
+        mgr = BlobManager(self.path)
+        removed, freed = mgr.gc(used)
+        return {"files_removed": removed, "bytes_freed": freed}
 
     def _validate_assign(self, key: str, value: Any, rec: Dict[str, Any]) -> None:
         # Full validation will run in save(); keep minimal checks here.
