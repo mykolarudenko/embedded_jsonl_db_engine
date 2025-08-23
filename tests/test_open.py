@@ -1,4 +1,3 @@
-import os
 from embedded_jsonl_db_engine import Database
 
 def make_schema():

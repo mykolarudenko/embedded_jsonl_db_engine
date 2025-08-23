@@ -389,12 +389,18 @@ class Database:
                     return None
                 def cmp(op: str, val, arg) -> bool:
                     try:
-                        if op == "$eq":  return val == arg
-                        if op == "$ne":  return val != arg
-                        if op == "$gt":  return val > arg
-                        if op == "$gte": return val >= arg
-                        if op == "$lt":  return val < arg
-                        if op == "$lte": return val <= arg
+                        if op == "$eq":
+                            return val == arg
+                        if op == "$ne":
+                            return val != arg
+                        if op == "$gt":
+                            return val > arg
+                        if op == "$gte":
+                            return val >= arg
+                        if op == "$lt":
+                            return val < arg
+                        if op == "$lte":
+                            return val <= arg
                         return False
                     except Exception:
                         return False

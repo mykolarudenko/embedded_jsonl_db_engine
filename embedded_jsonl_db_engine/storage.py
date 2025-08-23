@@ -2,7 +2,7 @@ from __future__ import annotations
 import io
 import os
 import json
-from typing import Any, Dict, Iterator, Tuple
+from typing import Dict, Iterator, Tuple
 from .errors import LockError, IOCorruptionError
 
 HEADER_T = "header"
@@ -92,7 +92,7 @@ class FileStorage:
             raise IOCorruptionError("file is not open")
         self._fh.seek(0)
         lines = [self._fh.readline() for _ in range(4)]
-        if any(l == "" for l in lines):
+        if any(line == "" for line in lines):
             raise IOCorruptionError("incomplete header (expected 4 lines)")
         def parse_line(s: str, expected_t: str) -> Dict:
             try:
