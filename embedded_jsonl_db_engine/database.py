@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
 import json
+import gzip
+import shutil
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from .schema import Schema
 from .taxonomy import TaxonomyAPI
@@ -530,10 +532,139 @@ class Database:
         raise NotImplementedError("Full-file migration for taxonomy changes with progress and backup.")
 
     def compact_now(self) -> None:
-        raise NotImplementedError("Implement compact with progress and rolling/daily backups.")
+        """
+        Rewrite file to remove garbage records based on current in-memory index.
+        Runs only if garbage_ratio >= 0.30.
+        """
+        # Compute garbage ratio as (total_meta - live_count) / total_meta
+        total_meta = 0
+        for _ in self._fs.iter_meta_offsets():
+            total_meta += 1
+        live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
+        live_count = len(live_entries)
+        if total_meta <= 0:
+            return
+        garbage_ratio = (total_meta - live_count) / max(1, total_meta)
+        if garbage_ratio < 0.30:
+            return
+
+        self._progress.emit("compact.start", 0, msg="Starting compaction", total_meta=total_meta, live=live_count)
+
+        # Close file handle to ensure stable rename on replace
+        self._fs.close()
+
+        tmp_path = f"{self.path}.compact.tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+            # Write header
+            lines = [
+                {"_t": "header", **self._header},
+                {"_t": "schema", "fields": self._schema._fields},
+                {"_t": "taxonomies", "items": self._taxonomies},
+                {"_t": "begin"},
+            ]
+            for obj in lines:
+                s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                dst.write(s + "\n")
+
+            # Copy live records in ts order
+            live_entries_sorted = sorted(live_entries, key=lambda e: e.ts_ms)
+            total = len(live_entries_sorted)
+            for i, e in enumerate(live_entries_sorted, 1):
+                line = self._fs.read_line_at(e.offset_data)
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                data_str = canonical_json(obj)
+                data_bytes = data_str.encode("utf-8")
+                ts_iso = now_iso()
+                meta_obj = {
+                    "_t": "meta",
+                    "id": e.id,
+                    "op": "put",
+                    "ts": ts_iso,
+                    "len_data": len(data_bytes),
+                    "sha256_data": sha256_hex(data_bytes),
+                }
+                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                dst.write(data_str + "\n")
+                self._progress.emit("compact.copy", int(i * 100 / max(1, total)), copied=i, total=total)
+
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except Exception:
+                pass
+
+        # Atomically replace and reopen
+        self._fs.replace_file(tmp_path)
+        self._open("+")
 
     def backup_now(self, kind: str = "rolling") -> None:
-        raise NotImplementedError("Implement rolling and daily backups with atomic replace.")
+        """
+        Create backups: rolling (.bak.N) or daily gz snapshot.
+        """
+        backup_conf = self._maintenance.get("backup", {}) if isinstance(self._maintenance, dict) else {}
+        keep = int(backup_conf.get("rolling_keep", 3))
+        daily_dirname = str(backup_conf.get("daily_dir", "daily"))
+
+        root_dir = os.path.join(os.path.dirname(os.path.abspath(self.path)), "embedded_jsonl_db_backup")
+        os.makedirs(root_dir, exist_ok=True)
+
+        # Ensure data is flushed by closing handle temporarily
+        self._fs.close()
+
+        base = os.path.basename(self.path)
+
+        if kind == "rolling":
+            self._progress.emit("backup.rolling", 0, msg="Rolling backup")
+            # Rotate .bak.N files
+            last_path = os.path.join(root_dir, f"{base}.bak.{keep}")
+            if os.path.exists(last_path):
+                try:
+                    os.remove(last_path)
+                except Exception:
+                    pass
+            for i in range(keep, 1, -1):
+                src = os.path.join(root_dir, f"{base}.bak.{i-1}")
+                dst = os.path.join(root_dir, f"{base}.bak.{i}")
+                if os.path.exists(src):
+                    try:
+                        os.replace(src, dst)
+                    except Exception:
+                        try:
+                            shutil.copy2(src, dst)
+                            os.remove(src)
+                        except Exception:
+                            pass
+            dest1 = os.path.join(root_dir, f"{base}.bak.1")
+            with open(self.path, "rb") as src_f, open(dest1, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
+                dst_f.flush()
+                try:
+                    os.fsync(dst_f.fileno())
+                except Exception:
+                    pass
+            self._progress.emit("backup.rolling", 100, msg="Rolling backup complete", path=dest1)
+
+        elif kind == "daily":
+            self._progress.emit("backup.daily", 0, msg="Daily backup")
+            daily_dir = os.path.join(root_dir, daily_dirname)
+            os.makedirs(daily_dir, exist_ok=True)
+            date_str = now_iso().split("T", 1)[0]
+            dest = os.path.join(daily_dir, f"{base}.{date_str}.jsonl.gz")
+            with open(self.path, "rb") as src_f, gzip.open(dest, "wb") as gz:
+                shutil.copyfileobj(src_f, gz, length=1024 * 1024)
+                try:
+                    gz.flush()
+                except Exception:
+                    pass
+            self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
+        else:
+            raise ValidationError(f"Unknown backup kind: {kind!r}")
+
+        # Reacquire exclusive lock without full reopen
+        self._fs.open_exclusive("+")
 
     def put_blob(self, stream_or_bytes, *, mime: str, filename: str | None = None) -> Dict[str, Any]:
         raise NotImplementedError("Delegate to BlobManager and return ref dict.")
