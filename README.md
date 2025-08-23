@@ -10,5 +10,9 @@ Install
 Quick start
 - See docs in package and upcoming examples.
 
+Contributing
+- Development setup: run ./setup.sh to install dev extras, then ruff and pytest locally.
+- Roadmap: implement storage I/O, open/index build, CRUD, compaction/backups, taxonomy migrations, blobs.
+
 License
 MIT
