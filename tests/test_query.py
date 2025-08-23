@@ -94,3 +94,27 @@ def test_fast_projection_simple(tmp_path):
     lst = list(db.find({"age": {"$gte": 10}}, fields=["name", "age"]))
     assert all(set(rec.keys()) <= {"id", "name", "age"} for rec in lst)
     assert all(isinstance(rec["age"], int) for rec in lst)
+
+def test_or_and_regex(tmp_path):
+    db_path = tmp_path / "users.jsonl"
+    db = Database(str(db_path), schema=make_schema(), on_progress=progress_printer)
+    db.taxonomy("categories").upsert("general")
+
+    # Insert records
+    data = [("Alice", 25), ("Bob", 10), ("Charlie", 50)]
+    for n, a in data:
+        r = db.new()
+        r["name"] = n
+        r["age"] = a
+        r["categories"] = ["general"]
+        r.save()
+
+    # Regex on name (case-insensitive)
+    got = list(db.find({"name": {"$regex": "^al", "$flags": "i"}}))
+    assert any(rec["name"] == "Alice" for rec in got)
+    assert all(isinstance(rec["name"], str) for rec in got)
+
+    # $or combining age==10 or name starting with Ch
+    got2 = list(db.find({"$or": [{"age": {"$eq": 10}}, {"name": {"$regex": "^Ch"}}]}))
+    names = {rec["name"] for rec in got2}
+    assert names == {"Bob", "Charlie"}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import json
+import re
 import io
 import gzip
 import shutil
@@ -247,15 +248,27 @@ class Database:
         # - simple ops: $eq/$ne/$gt/$gte/$lt/$lte
         # - $contains for list[str] or substring for str
         def is_op_key(k: str) -> bool:
-            return k in ("$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$contains", "$in", "$nin")
+            return k in ("$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$contains", "$in", "$nin", "$regex")
 
         def match_obj(obj: Dict[str, Any], q: Dict[str, Any]) -> bool:
+            # Top-level $or support (disjunction). Other keys are ANDed with it.
+            if "$or" in q:
+                ors = q.get("$or")
+                if not isinstance(ors, list) or not ors:
+                    return False
+                if not any(isinstance(sub, dict) and match_obj(obj, sub) for sub in ors):
+                    return False
             for k, v in q.items():
+                if k == "$or":
+                    continue
                 if k.startswith("$"):
                     return False  # unsupported top-level operators
                 if isinstance(v, dict) and any(is_op_key(op) for op in v.keys()):
                     val = obj.get(k)
                     for op, arg in v.items():
+                        if op == "$flags":
+                            # Used together with $regex; ignore here
+                            continue
                         if op == "$eq":
                             if val != arg:
                                 return False
@@ -312,6 +325,24 @@ class Database:
                                 if str(arg) not in val:
                                     return False
                             else:
+                                return False
+                        elif op == "$regex":
+                            if not isinstance(val, str):
+                                return False
+                            flags_val = 0
+                            try:
+                                flags_str = v.get("$flags", "")
+                                if isinstance(flags_str, str):
+                                    if "i" in flags_str:
+                                        flags_val |= re.IGNORECASE
+                                    if "m" in flags_str:
+                                        flags_val |= re.MULTILINE
+                                    if "s" in flags_str:
+                                        flags_val |= re.DOTALL
+                                pattern = re.compile(str(arg), flags_val)
+                            except Exception:
+                                return False
+                            if not pattern.search(val):
                                 return False
                         else:
                             return False
