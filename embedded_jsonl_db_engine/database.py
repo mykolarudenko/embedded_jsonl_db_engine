@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from .schema import Schema
 from .taxonomy import TaxonomyAPI
 from .index import InMemoryIndex, MetaEntry
@@ -83,6 +83,7 @@ class Database:
         self._sec_paths: List[str] = []
         self._rev_list_paths: List[Tuple[str, str]] = []
         self._rev_single_paths: List[Tuple[str, str]] = []
+        self._rev_map: Dict[str, str] = {}
         self._compute_index_specs()
         self._open(mode)
 
@@ -259,9 +260,16 @@ class Database:
                         return False
             return True
 
+        # Prefilter with in-memory indexes where possible
+        cand_ids = self._prefilter_ids(query)
+        if cand_ids is None:
+            items_iter = self._index.meta.items()
+        else:
+            items_iter = ((rid, self._index.meta.get(rid)) for rid in cand_ids)
+
         recs: List[TDBRecord] = []
-        for rec_id, entry in self._index.meta.items():
-            if entry.deleted or entry.offset_data is None:
+        for rec_id, entry in items_iter:
+            if not entry or entry.deleted or entry.offset_data is None:
                 continue
             line = self._fs.read_line_at(entry.offset_data)
             try:
@@ -337,11 +345,66 @@ class Database:
 
     # ----- Index helpers -----
 
+    def _prefilter_ids(self, query: Dict[str, Any]) -> Optional[Set[str]]:
+        """
+        Use in-memory indexes to preselect candidate ids.
+        Supports:
+          - equality on scalar indexed paths
+          - equality on single-taxonomy string paths
+          - $contains on list[str] taxonomy paths
+        Returns:
+          - set of ids if at least one indexable predicate found
+          - None otherwise (caller should full-scan)
+        """
+        terms: List[Tuple[str, str, Any]] = []
+
+        def walk(obj: Dict[str, Any], base: Tuple[str, ...]) -> None:
+            for k, v in obj.items():
+                if k.startswith("$"):
+                    continue
+                new_base = base + (k,)
+                if isinstance(v, dict):
+                    ops = [op for op in v.keys() if isinstance(op, str) and op.startswith("$")]
+                    if ops:
+                        if "$eq" in v:
+                            terms.append(("/".join(new_base), "$eq", v["$eq"]))
+                        if "$contains" in v:
+                            terms.append(("/".join(new_base), "$contains", v["$contains"]))
+                    else:
+                        walk(v, new_base)
+                else:
+                    terms.append(("/".join(new_base), "$eq", v))
+
+        walk(query, ())
+
+        candidate_ids: Optional[Set[str]] = None
+
+        for path, op, arg in terms:
+            ids: Optional[Set[str]] = None
+            if op == "$eq":
+                if path in self._sec_paths:
+                    key = self._canonicalize_value(arg)
+                    ids = set(self._index.secondary.get((path, key), set()))
+                elif path in self._rev_map:
+                    taxo = self._rev_map[path]
+                    ids = set(self._index.reverse.get((taxo, str(arg)), set()))
+            elif op == "$contains":
+                if path in self._rev_map:
+                    taxo = self._rev_map[path]
+                    ids = set(self._index.reverse.get((taxo, str(arg)), set()))
+            if ids is not None:
+                candidate_ids = ids if candidate_ids is None else (candidate_ids & ids)
+                if candidate_ids is not None and len(candidate_ids) == 0:
+                    break
+
+        return candidate_ids
+
     def _compute_index_specs(self) -> None:
         # Build lists of paths for secondary and reverse indexes based on schema hints
         self._sec_paths.clear()
         self._rev_list_paths.clear()
         self._rev_single_paths.clear()
+        self._rev_map.clear()
         flat = getattr(self._schema, "_flat", {})
         for path_tuple, fspec in flat.items():
             path = "/".join(path_tuple)
@@ -351,9 +414,13 @@ class Database:
             if t in _SCALAR_TYPES and getattr(fspec, "index", False):
                 self._sec_paths.append(path)
             if t == "list" and getattr(fspec, "index_membership", False) and getattr(fspec, "taxonomy", None):
-                self._rev_list_paths.append((path, getattr(fspec, "taxonomy")))
+                taxo = getattr(fspec, "taxonomy")
+                self._rev_list_paths.append((path, taxo))
+                self._rev_map[path] = taxo
             if t in ("str",) and getattr(fspec, "taxonomy", None) and getattr(fspec, "taxonomy_mode", None) == "single":
-                self._rev_single_paths.append((path, getattr(fspec, "taxonomy")))
+                taxo = getattr(fspec, "taxonomy")
+                self._rev_single_paths.append((path, taxo))
+                self._rev_map[path] = taxo
 
     def _extract_at_path(self, obj: Dict[str, Any], path: str):
         cur: Any = obj
