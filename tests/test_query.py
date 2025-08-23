@@ -76,3 +76,21 @@ def test_nested_order_by(tmp_path):
     # Sort by nested path
     got = list(db.find({"active": True}, order_by=[("profile/score", "asc")], fields=["name", "profile"]))
     assert [rec["profile"]["score"] for rec in got] == [1, 2, 3]
+
+def test_fast_projection_simple(tmp_path):
+    db_path = tmp_path / "users.jsonl"
+    db = Database(str(db_path), schema=make_schema(), on_progress=progress_printer)
+    db.taxonomy("categories").upsert("general")
+
+    # Insert records
+    for i in range(5):
+        r = db.new()
+        r["name"] = f"N{i}"
+        r["age"] = i * 10
+        r["categories"] = ["general"]
+        r.save()
+
+    # Simple query with projection of scalar fields only
+    lst = list(db.find({"age": {"$gte": 10}}, fields=["name", "age"]))
+    assert all(set(rec.keys()) <= {"id", "name", "age"} for rec in lst)
+    assert all(isinstance(rec["age"], int) for rec in lst)

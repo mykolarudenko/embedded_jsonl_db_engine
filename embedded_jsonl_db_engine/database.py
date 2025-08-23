@@ -374,6 +374,27 @@ class Database:
                     break
                 if path not in pat_map:
                     pat_map[path] = (tp, compile_path_pattern(path, tp))
+        # Prepare fast projection (optional) for scalar fields and simple order_by
+        can_fast_project = False
+        proj_pat_map: Dict[str, Any] = {}
+        need_fields: Set[str] = set()
+        if use_fast and fields is not None:
+            can_fast_project = True
+            for f in fields:
+                if "/" in f or f not in self._scalar_type_map:
+                    can_fast_project = False
+                    break
+                need_fields.add(f)
+            if can_fast_project and order_by:
+                for of, _dir in order_by:
+                    if "/" in of or of not in self._scalar_type_map:
+                        can_fast_project = False
+                        break
+                    need_fields.add(of)
+            if can_fast_project and need_fields:
+                for p in need_fields:
+                    tp2 = self._scalar_type_map[p]
+                    proj_pat_map[p] = (tp2, compile_path_pattern(p, tp2))
 
         recs: List[TDBRecord] = []
         for rec_id, entry in items_iter:
@@ -444,10 +465,22 @@ class Database:
                 if not matched:
                     continue
                 # For matched fast-path records, materialize object for result/ordering/projection
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
+                obj = None
+                if can_fast_project and proj_pat_map:
+                    obj_dict: Dict[str, Any] = {}
+                    for p, (ptp, ppat) in proj_pat_map.items():
+                        rawp = extract_first(ppat, line)
+                        valp = parse_val(ptp, rawp)
+                        if valp is not None:
+                            obj_dict[p] = valp
+                    # Always include id for downstream projection/sorting
+                    obj_dict["id"] = rec_id
+                    obj = obj_dict
+                else:
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
             else:
                 try:
                     obj = json.loads(line)
@@ -1050,13 +1083,16 @@ class Database:
             os.makedirs(daily_dir, exist_ok=True)
             date_str = now_iso().split("T", 1)[0]
             dest = os.path.join(daily_dir, f"{base}.{date_str}.jsonl.gz")
-            with open(self.path, "rb") as src_f, gzip.open(dest, "wb") as gz:
-                shutil.copyfileobj(src_f, gz, length=1024 * 1024)
-                try:
-                    gz.flush()
-                except Exception:
-                    pass
-            self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
+            if os.path.exists(dest):
+                self._progress.emit("backup.daily", 100, msg="Daily backup exists", path=dest)
+            else:
+                with open(self.path, "rb") as src_f, gzip.open(dest, "wb") as gz:
+                    shutil.copyfileobj(src_f, gz, length=1024 * 1024)
+                    try:
+                        gz.flush()
+                    except Exception:
+                        pass
+                self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
         else:
             raise ValidationError(f"Unknown backup kind: {kind!r}")
 

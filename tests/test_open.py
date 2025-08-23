@@ -1,3 +1,4 @@
+import os
 from embedded_jsonl_db_engine import Database
 
 def progress_printer(evt):
@@ -79,6 +80,14 @@ def test_crud_index_backup_compact(tmp_path):
 
     db.backup_now("daily")
     assert (backup_dir / "daily").exists()
+    daily_dir = backup_dir / "daily"
+    files = sorted(os.listdir(daily_dir))
+    assert len(files) == 1
+    dest_path = daily_dir / files[0]
+    mtime1 = os.path.getmtime(dest_path)
+    db.backup_now("daily")
+    mtime2 = os.path.getmtime(dest_path)
+    assert mtime2 == mtime1
 
     # After one put + one del, compaction should trigger (garbage_ratio >= 0.30)
     db.compact_now()
