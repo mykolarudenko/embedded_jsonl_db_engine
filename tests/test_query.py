@@ -1,5 +1,19 @@
 from embedded_jsonl_db_engine import Database
 
+def progress_printer(evt):
+    phase = evt.get("phase")
+    pct = int(evt.get("pct", 0))
+    last = getattr(progress_printer, "_last", {})
+    prev = last.get(phase, -1)
+    if pct == 100 or pct - prev >= 5 or prev == -1:
+        msg = evt.get("msg", "")
+        line = f"[progress] {phase} {pct}%"
+        if msg:
+            line += f" - {msg}"
+        print(line, flush=True)
+        last[phase] = pct
+        progress_printer._last = last
+
 def make_schema():
     return {
         "id":        {"type": "str", "mandatory": True, "index": True},
@@ -16,7 +30,7 @@ def make_schema():
 
 def test_projection_and_sorting(tmp_path):
     db_path = tmp_path / "users.jsonl"
-    db = Database(str(db_path), schema=make_schema())
+    db = Database(str(db_path), schema=make_schema(), on_progress=progress_printer)
 
     # Prepare taxonomy key for strict validation
     db.taxonomy("categories").upsert("general")
@@ -47,7 +61,7 @@ def test_nested_order_by(tmp_path):
     schema["profile"] = {"type": "object", "fields": {
         "score": {"type": "int", "default": 0, "index": True}
     }}
-    db = Database(str(db_path), schema=schema)
+    db = Database(str(db_path), schema=schema, on_progress=progress_printer)
     db.taxonomy("categories").upsert("general")
 
     # Insert with nested profile.score

@@ -1,6 +1,20 @@
 import time
 from embedded_jsonl_db_engine import Database
 
+def progress_printer(evt):
+    phase = evt.get("phase")
+    pct = int(evt.get("pct", 0))
+    last = getattr(progress_printer, "_last", {})
+    prev = last.get(phase, -1)
+    if pct == 100 or pct - prev >= 5 or prev == -1:
+        msg = evt.get("msg", "")
+        line = f"[progress] {phase} {pct}%"
+        if msg:
+            line += f" - {msg}"
+        print(line, flush=True)
+        last[phase] = pct
+        progress_printer._last = last
+
 def make_perf_schema():
     # Total 100 fields: 2 required + 3 indexed + 95 generic fields
     fields = {
@@ -30,7 +44,7 @@ def test_performance_big_dataset(tmp_path):
 
     # Initial open (creates header)
     t0 = time.perf_counter()
-    db = Database(str(db_path), schema=schema)
+    db = Database(str(db_path), schema=schema, on_progress=progress_printer)
     t1 = time.perf_counter()
     print(f"[perf] initial open (new file): {(t1 - t0):.3f}s")
 
@@ -53,13 +67,15 @@ def test_performance_big_dataset(tmp_path):
             else:
                 r[key] = (i % 3 == 0)
         r.save()
+        if (i + 1) % 1000 == 0:
+            print(f"[perf] inserted {i+1}/{N}", flush=True)
     t3 = time.perf_counter()
     print(f"[perf] insert {N} records: {(t3 - t2):.3f}s")
 
     # Close and reopen to measure index build time
     db.close()
     t4 = time.perf_counter()
-    db2 = Database(str(db_path), schema=schema)
+    db2 = Database(str(db_path), schema=schema, on_progress=progress_printer)
     t5 = time.perf_counter()
     print(f"[perf] reopen and build indexes for {N} records: {(t5 - t4):.3f}s")
 
@@ -79,7 +95,13 @@ def test_performance_big_dataset(tmp_path):
 
     # Update all records (empty query matches all)
     t10 = time.perf_counter()
-    updated = db2.update({}, {"f01": 999})
+    updated = 0
+    for idx, rec in enumerate(db2.find({}), 1):
+        rec["f01"] = 999
+        rec.save()
+        updated += 1
+        if idx % 1000 == 0:
+            print(f"[perf] updated {idx}/{N}", flush=True)
     t11 = time.perf_counter()
     print(f"[perf] update all {updated} records: {(t11 - t10):.3f}s")
 
