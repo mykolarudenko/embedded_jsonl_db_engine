@@ -2,7 +2,7 @@
 
 Embedded, single-file JSONL database with typed schema and taxonomies in the file header. In-memory indexes on open, fast regex plan for simple predicates, full JSON parse otherwise. Single-writer model with explicit compaction, rolling & daily backups, and external BLOB storage.
 
-Status: scaffold. Core I/O and heavy logic are intentionally left as NotImplementedError in code for incremental implementation.
+Status: alpha. Core features implemented: file I/O, in-memory indexes, CRUD, compaction, backups, taxonomy header + migrations, external BLOBs. Fast-regex plan is integrated for simple queries; complex queries fall back to full parse.
 
 Install
 - pip install embedded_jsonl_db_engine
@@ -27,15 +27,15 @@ Development bootstrap
   4) Add simple tests for open/new/save/get.
 
 What has been implemented so far
-- Package scaffold with all core modules and clear NotImplementedError stubs for heavy logic.
-- English comments and docstrings across the codebase.
-- TYPE_CHECKING import in taxonomy to avoid runtime circular imports.
-- Query helper is_simple_query() for fast-plan eligibility.
-- Fast regex path compiler scaffold (compile_path_pattern, extract_first).
-- Utils for ISO timestamps, epoch conversions, canonical JSON, sha256, and ULID-like ids.
-- In-memory index structures (MetaEntry, InMemoryIndex) for meta/secondary/reverse indexes.
-- Database/TDBRecord skeleton with validation hooks and change tracking.
-- FileStorage scaffold with constants and method signatures for low-level I/O.
+- Low-level file I/O (FileStorage): cross-platform exclusive lock, header read/write/rewrite, append meta+data with fsync, meta scan with offsets, atomic replace.
+- Database open with progress: lock, header init if missing, base meta index rebuild, secondary/reverse index build.
+- In-memory indexes: secondary (scalar) and reverse (taxonomy) indexes; built on open and maintained on save()/delete(); prefilter in find().
+- CRUD: new() with defaults, get() (with optional meta), save() with schema validation and canonical JSON, find() with predicate evaluation + index prefilter, update(), delete() (logical).
+- Queries: field projection (fields=[...]), ordering (supports nested paths "a/b"), skip/limit; is_simple_query() helper; fast regex plan for simple scalar predicates with fallback to full json.loads.
+- Maintenance: compact_now() (garbage ratio ≥ 0.30), backup_now() (rolling and daily .gz) with progress events.
+- Taxonomies: header-only updates (rewrite_header), full migrations (rename/merge/delete detach) with progress; strict schema validation for taxonomy-backed fields.
+- BLOBs: external CAS by sha256 with put/open/gc and Database wrappers.
+- Utilities: ISO timestamps, epoch converters, canonical JSON, sha256, ULID-like ids.
 
 License
 MIT
