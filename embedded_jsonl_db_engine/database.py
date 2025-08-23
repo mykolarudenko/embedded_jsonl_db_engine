@@ -1,10 +1,13 @@
 from __future__ import annotations
+import os
+import json
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .schema import Schema
 from .taxonomy import TaxonomyAPI
-from .index import InMemoryIndex
+from .index import InMemoryIndex, MetaEntry
 from .storage import FileStorage
 from .progress import Progress
+from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
 from .errors import ValidationError, ConflictError
 
 class TDBRecord(dict):
@@ -73,9 +76,54 @@ class Database:
 
     def _open(self, mode: str) -> None:
         """
-        Open stub. Will be implemented after FileStorage primitives are ready.
+        Open DB file: acquire lock, ensure header exists, scan meta to build in-memory index.
         """
-        raise NotImplementedError("Implement open: lock, read header, scan meta, build indexes.")
+        # Acquire lock/open
+        self._fs.open_exclusive(mode)
+
+        # Ensure header exists; if not, initialize a new header using provided schema
+        try:
+            _hdr, _schema_fields, taxonomies = self._fs.read_header_and_schema()
+            # Keep taxonomies from file (schema migration is out of scope here)
+            self._taxonomies = taxonomies or {}
+        except Exception:
+            # Initialize a new file
+            hdr = {
+                "format": "ejl1",
+                "table": os.path.splitext(os.path.basename(self.path))[0],
+                "created": now_iso(),
+                "defaults_always_materialized": True,
+            }
+            self._taxonomies = {}
+            self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
+
+        # Rebuild in-memory index from meta stream
+        self._index = InMemoryIndex()
+        for offset, line in self._fs.iter_meta_offsets():
+            try:
+                meta = json.loads(line)
+            except Exception:
+                continue
+            if meta.get("_t") != "meta":
+                continue
+            rec_id = meta.get("id")
+            if not rec_id:
+                continue
+            op = meta.get("op")
+            ts_iso = meta.get("ts") or now_iso()
+            ts_ms = iso_to_epoch_ms(ts_iso)
+            offset_data = None
+            if op == "put":
+                # Data line immediately follows meta line
+                offset_data = offset + len(line.encode("utf-8"))
+            entry = MetaEntry(
+                id=rec_id,
+                offset_meta=offset,
+                offset_data=offset_data if op == "put" else None,
+                deleted=(op == "del"),
+                ts_ms=ts_ms,
+            )
+            self._index.add_meta(entry)
 
     def new(self) -> TDBRecord:
         rec: Dict[str, Any] = {}
@@ -83,7 +131,20 @@ class Database:
         return TDBRecord(self, rec)
 
     def get(self, rec_id: str, *, include_meta: bool = False) -> TDBRecord | None:
-        raise NotImplementedError("Implement get() using index offsets and json.loads of data line.")
+        entry = self._index.meta.get(rec_id)
+        if not entry or entry.deleted or entry.offset_data is None:
+            return None
+        line = self._fs.read_line_at(entry.offset_data)
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None
+        rec = TDBRecord(self, obj)
+        rec._id = rec_id
+        rec._meta_offset = entry.offset_meta
+        rec._orig_hash = repr(sorted(rec.items()))
+        rec._dirty_fields.clear()
+        return rec
 
     def find(
         self,
@@ -136,7 +197,49 @@ class Database:
         return
 
     def _record_save(self, rec: TDBRecord, *, force: bool) -> None:
-        raise NotImplementedError("Implement record persistence with optimistic check by meta offset.")
+        # Assign id/createdAt on new records
+        if rec._id is None:
+            rec._id = new_ulid()
+            if "id" not in rec:
+                rec["id"] = rec._id
+            if "createdAt" not in rec:
+                rec["createdAt"] = now_iso()
+
+        if not force and not rec.dirty:
+            return
+
+        # Full validation
+        self._schema.validate(rec)
+
+        # Serialize and compute meta
+        data_str = canonical_json(dict(rec))
+        data_bytes = data_str.encode("utf-8")
+        ts_iso = now_iso()
+        meta = {
+            "id": rec._id,
+            "op": "put",
+            "ts": ts_iso,
+            "len_data": len(data_bytes),
+            "sha256_data": sha256_hex(data_bytes),
+        }
+
+        # Append and get offsets
+        off_meta, off_data = self._fs.append_meta_data(meta, data_str)
+
+        # Update index
+        entry = MetaEntry(
+            id=rec._id,
+            offset_meta=off_meta,
+            offset_data=off_data,
+            deleted=False,
+            ts_ms=iso_to_epoch_ms(ts_iso),
+        )
+        self._index.add_meta(entry)
+
+        # Sync state
+        rec._meta_offset = off_meta
+        rec._orig_hash = repr(sorted(rec.items()))
+        rec._dirty_fields.clear()
 
     @staticmethod
     def _deep_update(rec: Dict[str, Any], patch: Dict[str, Any]) -> None:
