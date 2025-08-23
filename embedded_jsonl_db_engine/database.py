@@ -98,6 +98,7 @@ class Database:
         """
         # Acquire lock/open
         self._fs.open_exclusive(mode)
+        self._progress.emit("open.start", 0, path=self.path)
 
         # Ensure header exists; if not, initialize a new header using provided schema
         try:
@@ -119,7 +120,10 @@ class Database:
 
         # Rebuild in-memory index from meta stream
         self._index = InMemoryIndex()
-        for offset, line in self._fs.iter_meta_offsets():
+        meta_lines = list(self._fs.iter_meta_offsets())
+        total = len(meta_lines)
+        self._progress.emit("open.scan_meta", 0, total=total)
+        for i, (offset, line) in enumerate(meta_lines, 1):
             try:
                 meta = json.loads(line)
             except Exception:
@@ -144,8 +148,11 @@ class Database:
                 ts_ms=ts_ms,
             )
             self._index.add_meta(entry)
+            self._progress.emit("open.scan_meta", int(i * 100 / max(1, total)), scanned=i, total=total)
 
         # Build secondary & reverse indexes from live records
+        self._progress.emit("open.build_indexes", 0, total=len(self._index.meta))
+        built = 0
         for rid, ent in self._index.meta.items():
             if ent.deleted or ent.offset_data is None:
                 continue
@@ -155,6 +162,10 @@ class Database:
             except Exception:
                 continue
             self._index_add_from_obj(rid, obj)
+            built += 1
+            if built % 100 == 0:
+                self._progress.emit("open.build_indexes", int(built * 100 / max(1, len(self._index.meta))), built=built)
+        self._progress.emit("open.done", 100, msg="Open complete")
 
     def new(self) -> TDBRecord:
         rec: Dict[str, Any] = {}
@@ -316,7 +327,18 @@ class Database:
         else:
             selected = recs[start:start + int(limit)]
         for r in selected:
-            yield r
+            if fields:
+                field_set = set(fields)
+                field_set.add("id")
+                obj = {k: r.get(k) for k in field_set if k in r}
+                r2 = TDBRecord(self, obj)
+                r2._id = r.id
+                r2._meta_offset = r._meta_offset
+                r2._orig_hash = r2._hash_data()
+                r2._dirty_fields.clear()
+                yield r2
+            else:
+                yield r
 
     def update(self, query: Dict[str, Any], patch: Dict[str, Any]) -> int:
         n = 0
