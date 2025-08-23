@@ -58,3 +58,51 @@ def test_conflict_detection(tmp_path):
     r1["age"] = 100
     with pytest.raises(ConflictError):
         r1.save()
+
+
+def test_progress_events(tmp_path):
+    events = []
+
+    def collect(evt):
+        events.append(evt.get("phase"))
+
+    db_path = tmp_path / "events.jsonl"
+    db = Database(str(db_path), schema=make_schema(), on_progress=collect)
+
+    # Open should emit progress
+    assert any(p in ("open.start", "open.scan_meta", "open.build_indexes", "open.done") for p in events)
+
+    # Insert few records
+    ids = []
+    for i in range(3):
+        r = db.new()
+        r["name"] = f"U{i}"
+        r.save()
+        ids.append(r.id)
+
+    # Update progress
+    events.clear()
+    n_upd = db.update({}, {"age": 1})
+    assert n_upd == 3
+    assert "update.start" in events and "update.done" in events
+
+    # Delete progress
+    events.clear()
+    n_del = db.delete({"id": ids[0]})
+    assert n_del == 1
+    assert "delete.start" in events and "delete.done" in events
+
+    # Backup progress
+    events.clear()
+    db.backup_now("rolling")
+    assert "backup.rolling" in events
+    events.clear()
+    db.backup_now("daily")
+    assert "backup.daily" in events
+
+    # Compaction progress (should trigger after one delete out of three puts)
+    events.clear()
+    db.compact_now()
+    assert "compact.start" in events
+    assert "compact.copy" in events
+    assert "compact.done" in events

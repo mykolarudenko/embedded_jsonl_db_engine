@@ -1029,6 +1029,7 @@ class Database:
         # Atomically replace and reopen
         self._fs.replace_file(tmp_path)
         self._open("+")
+        self._progress.emit("compact.done", 100, msg="Compaction complete", live=live_count)
 
     def backup_now(self, kind: str = "rolling") -> None:
         """
