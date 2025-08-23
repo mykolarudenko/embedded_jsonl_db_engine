@@ -1,5 +1,8 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .database import Database  # only for type checking to avoid circular import
 
 class TaxonomyAPI:
     """
