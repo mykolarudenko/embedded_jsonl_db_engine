@@ -116,6 +116,9 @@ class Database:
             # Keep taxonomies from file (schema migration is out of scope here)
             self._header = _hdr
             self._taxonomies = taxonomies or {}
+            # Align schema to on-disk schema and recompute index specs
+            self._schema = Schema(_schema_fields)
+            self._compute_index_specs()
         except IOCorruptionError:
             # Initialize a new file
             hdr = {
@@ -127,6 +130,7 @@ class Database:
             self._header = hdr
             self._taxonomies = {}
             self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
+            self._compute_index_specs()
 
         # Rebuild in-memory index from meta stream
         self._index = InMemoryIndex()
@@ -202,8 +206,10 @@ class Database:
             if "sha256_data" in meta_obj:
                 if meta_obj["sha256_data"] != sha256_hex(data_bytes):
                     raise IOCorruptionError("data hash mismatch at read")
+        except IOCorruptionError:
+            raise
         except Exception:
-            # Do not fail hard on meta read/parse; only strict mismatch raises above
+            # Ignore non-critical meta read/parse issues
             pass
         rec = TDBRecord(self, obj)
         rec._id = rec_id
@@ -538,6 +544,8 @@ class Database:
                     if ops:
                         if "$eq" in v:
                             terms.append(("/".join(new_base), "$eq", v["$eq"]))
+                        if "$in" in v:
+                            terms.append(("/".join(new_base), "$in", v["$in"]))
                         if "$contains" in v:
                             terms.append(("/".join(new_base), "$contains", v["$contains"]))
                     else:
@@ -558,6 +566,19 @@ class Database:
                 elif path in self._rev_map:
                     taxo = self._rev_map[path]
                     ids = set(self._index.reverse.get((taxo, str(arg)), set()))
+            elif op == "$in":
+                if isinstance(arg, list):
+                    union_ids: Set[str] = set()
+                    if path in self._sec_paths:
+                        for av in arg:
+                            key = self._canonicalize_value(av)
+                            union_ids |= self._index.secondary.get((path, key), set())
+                        ids = set(union_ids)
+                    elif path in self._rev_map:
+                        taxo = self._rev_map[path]
+                        for av in arg:
+                            union_ids |= self._index.reverse.get((taxo, str(av)), set())
+                        ids = set(union_ids)
             elif op == "$contains":
                 if path in self._rev_map:
                     taxo = self._rev_map[path]
@@ -1060,6 +1081,12 @@ class Database:
         mgr = BlobManager(self.path)
         removed, freed = mgr.gc(used)
         return {"files_removed": removed, "bytes_freed": freed}
+
+    def close(self) -> None:
+        """
+        Close underlying file handle.
+        """
+        self._fs.close()
 
     def _validate_taxonomies_strict(self, obj: Dict[str, Any]) -> None:
         """

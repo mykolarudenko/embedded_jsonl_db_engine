@@ -49,6 +49,10 @@ def test_crud_index_backup_compact(tmp_path):
     r3 = db.get(rid)
     assert r3 is not None and r3["age"] == 31
 
+    # $in operator should work with index prefilter
+    got_in = list(db.find({"age": {"$in": [10, 31, 99]}}))
+    assert any(rec.id == rid for rec in got_in)
+
     # Delete and ensure not found
     n_del = db.delete({"id": rid})
     assert n_del == 1
@@ -59,6 +63,9 @@ def test_crud_index_backup_compact(tmp_path):
     db.backup_now("rolling")
     backup_dir = tmp_path / "embedded_jsonl_db_backup"
     assert backup_dir.exists()
+
+    db.backup_now("daily")
+    assert (backup_dir / "daily").exists()
 
     # After one put + one del, compaction should trigger (garbage_ratio >= 0.30)
     db.compact_now()
@@ -90,3 +97,18 @@ def test_taxonomy_header_update(tmp_path):
     r_after = db.get(rid)
     assert r_after is not None
     assert "health_and_fitness" in r_after.get("categories", [])
+
+
+def test_blobs_gc(tmp_path):
+    db_path = tmp_path / "users.jsonl"
+    db = Database(str(db_path), schema=make_schema())
+
+    # Put and open blob
+    ref = db.put_blob(b"hello world", mime="text/plain", filename="hello.txt")
+    with db.open_blob(ref) as f:
+        data = f.read()
+    assert data == b"hello world"
+
+    # No live references, GC should remove it
+    stats = db.gc_blobs()
+    assert stats["files_removed"] >= 1
