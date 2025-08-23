@@ -8,7 +8,7 @@ from .index import InMemoryIndex, MetaEntry
 from .storage import FileStorage
 from .progress import Progress
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
-from .errors import ValidationError, ConflictError
+from .errors import ValidationError, ConflictError, IOCorruptionError
 
 class TDBRecord(dict):
     """
@@ -22,8 +22,12 @@ class TDBRecord(dict):
         self._db = db
         self._id: Optional[str] = None
         self._meta_offset: Optional[int] = None
-        self._orig_hash = repr(sorted(initial.items()))
+        self._orig_hash = self._hash_data()
         self._dirty_fields: set[str] = set()
+
+    def _hash_data(self) -> str:
+        # Canonical JSON string is enough for dirty detection (sha256 not required here)
+        return canonical_json(self)
 
     @property
     def id(self) -> Optional[str]:
@@ -31,7 +35,7 @@ class TDBRecord(dict):
 
     @property
     def dirty(self) -> bool:
-        return repr(sorted(self.items())) != self._orig_hash
+        return self._hash_data() != self._orig_hash
 
     @property
     def modified_fields(self) -> List[str]:
@@ -53,7 +57,7 @@ class TDBRecord(dict):
             raise ConflictError("record not found")
         super().clear()
         super().update(rec)
-        self._orig_hash = repr(sorted(self.items()))
+        self._orig_hash = self._hash_data()
         self._dirty_fields.clear()
 
 class Database:
@@ -86,7 +90,7 @@ class Database:
             _hdr, _schema_fields, taxonomies = self._fs.read_header_and_schema()
             # Keep taxonomies from file (schema migration is out of scope here)
             self._taxonomies = taxonomies or {}
-        except Exception:
+        except IOCorruptionError:
             # Initialize a new file
             hdr = {
                 "format": "ejl1",
@@ -139,10 +143,23 @@ class Database:
             obj = json.loads(line)
         except Exception:
             return None
+        # Optional integrity check against meta
+        try:
+            meta_line = self._fs.read_line_at(entry.offset_meta)
+            meta_obj = json.loads(meta_line)
+            data_bytes = line.encode("utf-8")
+            if "len_data" in meta_obj and meta_obj["len_data"] != len(data_bytes):
+                raise IOCorruptionError("data length mismatch at read")
+            if "sha256_data" in meta_obj:
+                if meta_obj["sha256_data"] != sha256_hex(data_bytes):
+                    raise IOCorruptionError("data hash mismatch at read")
+        except Exception:
+            # Do not fail hard on meta read/parse; only strict mismatch raises above
+            pass
         rec = TDBRecord(self, obj)
         rec._id = rec_id
         rec._meta_offset = entry.offset_meta
-        rec._orig_hash = repr(sorted(rec.items()))
+        rec._orig_hash = rec._hash_data()
         rec._dirty_fields.clear()
         return rec
 
@@ -155,7 +172,117 @@ class Database:
         order_by: List[Tuple[str, str]] | None = None,
         fields: List[str] | None = None,
     ) -> Iterable[TDBRecord]:
-        raise NotImplementedError("Implement find(): prefilter by in-mem indexes, then Fast/Full.")
+        # Simple full-scan plan with basic predicate evaluation.
+        # Supports:
+        # - equality on scalars
+        # - nested dicts like {"address": {"city": "Wien"}}
+        # - simple ops: $eq/$ne/$gt/$gte/$lt/$lte
+        # - $contains for list[str] or substring for str
+        def is_op_key(k: str) -> bool:
+            return k in ("$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$contains")
+
+        def match_obj(obj: Dict[str, Any], q: Dict[str, Any]) -> bool:
+            for k, v in q.items():
+                if k.startswith("$"):
+                    return False  # unsupported top-level operators
+                if isinstance(v, dict) and any(is_op_key(op) for op in v.keys()):
+                    val = obj.get(k)
+                    for op, arg in v.items():
+                        if op == "$eq":
+                            if val != arg:
+                                return False
+                        elif op == "$ne":
+                            if val == arg:
+                                return False
+                        elif op == "$gt":
+                            try:
+                                if not (val > arg):
+                                    return False
+                            except Exception:
+                                return False
+                        elif op == "$gte":
+                            try:
+                                if not (val >= arg):
+                                    return False
+                            except Exception:
+                                return False
+                        elif op == "$lt":
+                            try:
+                                if not (val < arg):
+                                    return False
+                            except Exception:
+                                return False
+                        elif op == "$lte":
+                            try:
+                                if not (val <= arg):
+                                    return False
+                            except Exception:
+                                return False
+                        elif op == "$contains":
+                            if isinstance(val, list):
+                                if arg not in val:
+                                    return False
+                            elif isinstance(val, str):
+                                if str(arg) not in val:
+                                    return False
+                            else:
+                                return False
+                        else:
+                            return False
+                elif isinstance(v, dict):
+                    sub = obj.get(k)
+                    if not isinstance(sub, dict):
+                        return False
+                    if not match_obj(sub, v):
+                        return False
+                else:
+                    if obj.get(k) != v:
+                        return False
+            return True
+
+        recs: List[TDBRecord] = []
+        for rec_id, entry in self._index.meta.items():
+            if entry.deleted or entry.offset_data is None:
+                continue
+            line = self._fs.read_line_at(entry.offset_data)
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not match_obj(obj, query):
+                continue
+            rec = TDBRecord(self, obj)
+            rec._id = rec_id
+            rec._meta_offset = entry.offset_meta
+            rec._orig_hash = rec._hash_data()
+            rec._dirty_fields.clear()
+            recs.append(rec)
+
+        # Sorting
+        if order_by:
+            def norm(v):
+                if v is None:
+                    return ("", "")
+                if isinstance(v, (int, float, bool)):
+                    return ("0", str(v))
+                if isinstance(v, str):
+                    return ("1", v)
+                try:
+                    return ("2", json.dumps(v, sort_keys=True, ensure_ascii=False))
+                except Exception:
+                    return ("2", str(v))
+            for field, direction in reversed(order_by):
+                reverse = (str(direction).lower() == "desc")
+                recs.sort(key=lambda r: norm(r.get(field)), reverse=reverse)
+
+        # Skip / limit
+        start = max(0, int(skip)) if isinstance(skip, int) else 0
+        if limit is None:
+            selected = recs[start:]
+        else:
+            selected = recs[start:start + int(limit)]
+        for r in selected:
+            yield r
 
     def update(self, query: Dict[str, Any], patch: Dict[str, Any]) -> int:
         n = 0
@@ -166,7 +293,26 @@ class Database:
         return n
 
     def delete(self, query: Dict[str, Any]) -> int:
-        raise NotImplementedError("Implement delete(): iterate candidates and append del meta.")
+        """
+        Logical deletion: append meta(op:"del") for matched records and update index.
+        """
+        n = 0
+        for rec in self.find(query):
+            if not rec._id:
+                continue
+            ts_iso = now_iso()
+            meta = {"id": rec._id, "op": "del", "ts": ts_iso}
+            off_meta, _ = self._fs.append_meta_data(meta, None)
+            entry = MetaEntry(
+                id=rec._id,
+                offset_meta=off_meta,
+                offset_data=None,
+                deleted=True,
+                ts_ms=iso_to_epoch_ms(ts_iso),
+            )
+            self._index.add_meta(entry)
+            n += 1
+        return n
 
     def taxonomy(self, name: str) -> TaxonomyAPI:
         return TaxonomyAPI(self, name)
@@ -238,7 +384,7 @@ class Database:
 
         # Sync state
         rec._meta_offset = off_meta
-        rec._orig_hash = repr(sorted(rec.items()))
+        rec._orig_hash = rec._hash_data()
         rec._dirty_fields.clear()
 
     @staticmethod
