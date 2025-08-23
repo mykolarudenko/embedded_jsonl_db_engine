@@ -1,4 +1,4 @@
-embedded_jsonl_db_engine
+### Embedded JSONL DB Engine
 
 Embedded, single-file JSONL database with a typed schema and taxonomies stored in the file header. It builds in-memory indexes on open, executes fast regex queries for simple predicates and falls back to full JSON parse for complex ones. Designed for single-process exclusive use, with built-in compaction, rolling & daily backups, and external BLOB storage.
 
