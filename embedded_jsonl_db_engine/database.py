@@ -15,7 +15,7 @@ from .progress import Progress
 from .fastregex import compile_path_pattern, extract_first
 from .query import is_simple_query
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
-from .errors import ValidationError, ConflictError, IOCorruptionError, DuplicateIdError
+from .errors import ValidationError, ConflictError, IOCorruptionError, DuplicateIdError, SchemaError
 
 # Scalar types used for building secondary indexes
 _SCALAR_TYPES = {"str", "int", "float", "bool", "datetime"}
@@ -122,7 +122,7 @@ class Database:
             on_disk = _schema_fields
             if canonical_json(on_disk) != canonical_json(self._target_schema_fields):
                 self._progress.emit("schema.migrate", 0, msg="Migrating schema")
-                self._migrate_schema_to(self._target_schema_fields)
+                self._migrate_schema_to(self._target_schema_fields, old_fields=on_disk)
                 return
             # Align schema to on-disk schema and recompute index specs
             self._schema = Schema(_schema_fields)
@@ -427,6 +427,19 @@ class Database:
             if not entry or entry.deleted or entry.offset_data is None:
                 continue
             line = self._fs.read_line_at(entry.offset_data)
+            # Integrity check against meta; skip corrupt records
+            try:
+                meta_line = self._fs.read_line_at(entry.offset_meta)
+                meta_obj = json.loads(meta_line)
+                data_str_no_nl = line[:-1] if line.endswith("\n") else line
+                data_bytes = data_str_no_nl.encode("utf-8")
+                if "len_data" in meta_obj and meta_obj["len_data"] != len(data_bytes):
+                    continue
+                if "sha256_data" in meta_obj and meta_obj["sha256_data"] != sha256_hex(data_bytes):
+                    continue
+            except Exception:
+                # On errors reading meta, proceed without skipping
+                pass
 
             matched = True
             if use_fast and terms:
@@ -1056,13 +1069,27 @@ class Database:
         self._fs.replace_file(tmp_path)
         self._open("+")
 
-    def _migrate_schema_to(self, new_fields: Dict[str, Any]) -> None:
+    def _migrate_schema_to(self, new_fields: Dict[str, Any], old_fields: Optional[Dict[str, Any]] = None) -> None:
         """
         Full-file rewrite to switch schema to new_fields.
         Applies defaults of the new schema and validates each record.
+        Disallows incompatible type changes (e.g., int -> str) on existing fields.
         """
         self._progress.emit("schema.migrate", 0, msg="Starting schema migration")
+        # Use provided old_fields (on-disk) or current in-memory schema as a baseline
+        base_old_fields = old_fields or self._schema._fields
         sch_new = Schema(new_fields)
+        sch_old = Schema(base_old_fields)
+        # Detect type changes on overlapping field paths
+        def _typemap(sch: Schema) -> Dict[str, str]:
+            return {"/".join(p): fs.type for p, fs in getattr(sch, "_flat", {}).items()}
+        t_old = _typemap(sch_old)
+        t_new = _typemap(sch_new)
+        for path, old_t in t_old.items():
+            if path in t_new:
+                new_t = t_new[path]
+                if new_t != old_t:
+                    raise SchemaError(f"schema type change for field '{path}': {old_t} -> {new_t} is not supported")
 
         # Close handle to avoid writing to unlinked inode during replace
         self._fs.close()
