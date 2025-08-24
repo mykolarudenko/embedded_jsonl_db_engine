@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish embedded_jsonl_db_engine to PyPI
 
 on:
   push:

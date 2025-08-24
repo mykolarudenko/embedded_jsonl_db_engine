@@ -2,7 +2,7 @@
 
 Human-readable and human-editable storage for serializable objects. A single JSONL file acts as a database with a typed schema and taxonomies stored in the header. Appends-only write model means you don't rewrite the whole file on every change. The schema exists but can evolve freely: add new fields at any time, and the database will self-adapt by materializing defaults and preserving existing data without manual migrations. For simple predicates we use a fast regex plan; otherwise we fall back to full JSON parsing. Single-writer model with explicit compaction, rolling & daily backups, and external BLOB storage.
 
-Status: alpha (0.1.0a1). Core features implemented: file I/O, in-memory indexes, CRUD, compaction, backups, taxonomy header + migrations, external BLOBs. Fast-regex plan is integrated for simple queries; complex queries fall back to full parse.
+Status: alpha (0.1.0a2). Core features implemented: file I/O, in-memory indexes, CRUD, compaction, backups, taxonomy header + migrations, external BLOBs. Fast-regex plan is integrated for simple queries; complex queries fall back to full parse.
 
 Test status
 - Full test suite passes locally (CRUD, queries, performance, backups retention, corruption handling, schema migration, taxonomy ops, blobs GC).

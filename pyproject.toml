@@ -26,9 +26,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/your-org/embedded_jsonl_db_engine"
-Repository = "https://github.com/your-org/embedded_jsonl_db_engine"
-Issues = "https://github.com/your-org/embedded_jsonl_db_engine/issues"
+Homepage = "https://github.com/mykolarudenko/embedded_jsonl_db_engine"
+Repository = "https://github.com/mykolarudenko/embedded_jsonl_db_engine"
+Issues = "https://github.com/mykolarudenko/embedded_jsonl_db_engine/issues"
 
 [project.optional-dependencies]
 ijson = ["ijson"]
