@@ -10,7 +10,7 @@ dependencies = []
 
 [project.optional-dependencies]
 ijson = ["ijson"]
-dev = ["mypy", "ruff", "pytest", "pytest-cov"]
+dev = ["mypy", "ruff", "pytest", "pytest-cov", "rich"]
 
 [tool.ruff]
 line-length = 100

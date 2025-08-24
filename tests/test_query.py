@@ -1,18 +1,22 @@
 from embedded_jsonl_db_engine import Database
+from rich.console import Console
+
+_console = Console()
 
 def progress_printer(evt):
-    phase = evt.get("phase")
+    phase = evt.get("phase", "")
     pct = int(evt.get("pct", 0))
-    last = getattr(progress_printer, "_last", {})
-    prev = last.get(phase, -1)
-    if pct == 100 or pct - prev >= 5 or prev == -1:
-        msg = evt.get("msg", "")
-        line = f"[progress] {phase} {pct}%"
-        if msg:
-            line += f" - {msg}"
-        print(line, flush=True)
-        last[phase] = pct
-        progress_printer._last = last
+    msg = evt.get("msg", "")
+    parts = []
+    if phase:
+        parts.append(phase)
+    parts.append(f"{pct}%")
+    if msg:
+        parts.append(f"- {msg}")
+    text = f"[progress] {' '.join(parts)}"
+    _console.print(f"\r{text}", end="", highlight=False, soft_wrap=False)
+    if pct >= 100:
+        _console.print()
 
 def make_schema():
     return {
