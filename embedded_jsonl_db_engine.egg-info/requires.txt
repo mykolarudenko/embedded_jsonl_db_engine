@@ -1,0 +1,10 @@
+
+[dev]
+mypy
+ruff
+pytest
+pytest-cov
+rich
+
+[ijson]
+ijson
