@@ -86,12 +86,13 @@ def test_performance_big_dataset(tmp_path):
     t7 = time.perf_counter()
     print(f"[perf] fast-plan query (>= {N//2}) matched={len(res_fast)}: {(t7 - t6):.3f}s")
 
-    # Full parse query (~20% match) on non-indexed field using $in to force full plan
-    q_full = {"f00": {"$in": ["grp1"]}}
+    # Full parse query (forced via $or) with the same logical predicate as fast plan
+    q_full = {"$or": [{"ix1": {"$gte": N // 2}}, {"ix1": {"$gte": N // 2}}]}
     t8 = time.perf_counter()
     res_full = list(db2.find(q_full))
     t9 = time.perf_counter()
-    print(f"[perf] full-parse query ($in on non-indexed) matched={len(res_full)}: {(t9 - t8):.3f}s")
+    print(f"[perf] full-parse query (same predicate via $or) matched={len(res_full)}: {(t9 - t8):.3f}s")
+    assert len(res_full) == len(res_fast)
 
     # Update all records (empty query matches all)
     t10 = time.perf_counter()

@@ -176,19 +176,7 @@ class Database:
 
         # Build secondary & reverse indexes from live records
         self._progress.emit("open.build_indexes", 0, total=len(self._index.meta))
-        built = 0
-        for rid, ent in self._index.meta.items():
-            if ent.deleted or ent.offset_data is None:
-                continue
-            try:
-                obj_line = self._fs.read_line_at(ent.offset_data)
-                obj = json.loads(obj_line)
-            except Exception:
-                continue
-            self._index_add_from_obj(rid, obj)
-            built += 1
-            if built % 100 == 0:
-                self._progress.emit("open.build_indexes", int(built * 100 / max(1, len(self._index.meta))), built=built)
+        self._build_indexes_on_open()
         self._progress.emit("open.done", 100, msg="Open complete")
 
     def new(self) -> TDBRecord:
@@ -708,6 +696,81 @@ class Database:
                 self._rev_single_paths.append((path, taxo))
                 self._rev_map[path] = taxo
                 self._rev_single_strict[path] = bool(getattr(fspec, "strict", False))
+
+    def _build_indexes_on_open(self) -> None:
+        """
+        Build in-memory indexes after meta scan.
+        Optimized path: if there are no list-based taxonomy fields, extract scalar values via fast regex
+        without full JSON parsing. Otherwise, fall back to full JSON parsing to handle membership lists.
+        """
+        # If there are no list-based taxonomy paths, we can avoid full JSON parse
+        if not self._rev_list_paths:
+            # Prepare patterns for scalar secondary indexes
+            pat_map: Dict[str, Tuple[str, Any]] = {}
+            for path in self._sec_paths:
+                tp = self._scalar_type_map.get(path)
+                if tp:
+                    pat_map[path] = (tp, compile_path_pattern(path, tp))
+            # Prepare patterns for single-string taxonomy refs
+            single_map: Dict[str, Tuple[str, Any, str]] = {}
+            for path, taxo in self._rev_single_paths:
+                tp = self._scalar_type_map.get(path, "str")
+                single_map[path] = (tp, compile_path_pattern(path, tp), taxo)
+
+            def parse_val(tp: str, s: Optional[str]):
+                if s is None:
+                    return None
+                try:
+                    if tp == "str" or tp == "datetime":
+                        return json.loads(s)
+                    if tp == "int":
+                        return int(s)
+                    if tp == "float":
+                        return float(s)
+                    if tp == "bool":
+                        return True if s == "true" else False
+                except Exception:
+                    return None
+                return None
+
+            total = len(self._index.meta)
+            built = 0
+            for rid, ent in self._index.meta.items():
+                if ent.deleted or ent.offset_data is None:
+                    continue
+                line = self._fs.read_line_at(ent.offset_data)
+                # Secondary scalar indexes
+                for path, (tp, pat) in pat_map.items():
+                    raw = extract_first(pat, line)
+                    val = parse_val(tp, raw)
+                    if isinstance(val, (str, int, float, bool)):
+                        self._index.add_secondary(path, self._canonicalize_value(val), rid)
+                # Single taxonomy refs
+                for path, (tp, pat, taxo) in single_map.items():
+                    raw = extract_first(pat, line)
+                    val = parse_val(tp, raw)
+                    if isinstance(val, str):
+                        self._index.add_reverse(taxo, val, rid)
+                built += 1
+                if built % 100 == 0:
+                    self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
+            return
+
+        # Fallback: need full JSON to process list-based taxonomy memberships
+        built = 0
+        total = len(self._index.meta)
+        for rid, ent in self._index.meta.items():
+            if ent.deleted or ent.offset_data is None:
+                continue
+            try:
+                obj_line = self._fs.read_line_at(ent.offset_data)
+                obj = json.loads(obj_line)
+            except Exception:
+                continue
+            self._index_add_from_obj(rid, obj)
+            built += 1
+            if built % 100 == 0:
+                self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
 
     def _extract_at_path(self, obj: Dict[str, Any], path: str):
         cur: Any = obj
