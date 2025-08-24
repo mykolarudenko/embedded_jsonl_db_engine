@@ -7,16 +7,23 @@ def progress_printer(evt):
     phase = evt.get("phase", "")
     pct = int(evt.get("pct", 0))
     msg = evt.get("msg", "")
+    state = getattr(progress_printer, "_state", {"last": {}})
+    last = state["last"]
+    prev = last.get(phase, -1)
+    if pct < 100 and prev != -1 and (pct - prev) < 5:
+        return
     parts = []
     if phase:
         parts.append(phase)
     parts.append(f"{pct}%")
-    if msg:
+    if msg and pct in (0, 100):
         parts.append(f"- {msg}")
     text = f"[progress] {' '.join(parts)}"
-    _console.print(f"\r{text}", end="", highlight=False, soft_wrap=False)
+    _console.print("\r\x1b[2K" + text, end="", highlight=False, soft_wrap=False)
     if pct >= 100:
         _console.print()
+    last[phase] = pct
+    progress_printer._state = state
 
 def make_schema():
     return {
