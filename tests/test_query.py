@@ -6,6 +6,7 @@ import os
 _force_tty = os.environ.get("FORCE_TTY", "").lower() in ("1", "true", "yes", "on")
 _isatty = getattr(sys.stderr, "isatty", lambda: False)()
 _console = Console(file=sys.stderr, force_terminal=(_isatty or _force_tty), color_system="standard")
+_tty_progress = os.environ.get("TTY_PROGRESS", "").lower() in ("1", "true", "yes", "on")
 
 def progress_printer(evt):
     phase = evt.get("phase", "")
@@ -14,7 +15,7 @@ def progress_printer(evt):
     state = getattr(progress_printer, "_state", {"last": {}})
     last = state["last"]
     prev = last.get(phase, -1)
-    is_tty = getattr(_console, "is_terminal", False)
+    is_tty = _tty_progress and getattr(_console, "is_terminal", False)
 
     if not is_tty:
         if pct in (0, 100) and (prev != pct):
