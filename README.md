@@ -21,6 +21,7 @@ Release to PyPI
 - Build: python -m build
 - Publish (test): twine upload --repository testpypi dist/*
 - Publish (prod): twine upload dist/*
+- CI publish: push tag vX.Y.Z[aN] to trigger .github/workflows/publish.yml via OIDC
 
 Quick start
 - See docs in package and upcoming examples.
