@@ -19,11 +19,19 @@ set -euo pipefail
 fail() { echo "[release] ERROR: $*" >&2; exit 1; }
 info() { echo "[release] $*"; }
 
-if [[ $# -ne 1 ]]; then
-  fail "Please provide version argument, e.g.: scripts/release.sh 0.1.0a3"
+# Accept version either as arg or from RELEASE_VERSION env var
+if [[ $# -gt 1 ]]; then
+  fail "Usage: scripts/release.sh [<version>] or set RELEASE_VERSION env var"
 fi
 
-VERSION="$1"
+if [[ $# -eq 1 ]]; then
+  VERSION="$1"
+elif [[ -n "${RELEASE_VERSION:-}" ]]; then
+  VERSION="$RELEASE_VERSION"
+else
+  fail "Provide version as argument or set RELEASE_VERSION env var, e.g.: RELEASE_VERSION=0.1.0a3 scripts/release.sh"
+fi
+
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc][0-9]+)?$ ]]; then
   fail "Version must look like 1.2.3 or 1.2.3a1/b1/rc1. Got: $VERSION"
 fi
