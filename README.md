@@ -19,7 +19,42 @@ Install
 
 
 Quick start
-- See docs in package and upcoming examples.
+
+Install
+- pip install embedded_jsonl_db_engine
+
+Minimal example (quick_start.py)
+```python
+from embedded_jsonl_db_engine import Database
+
+SCHEMA = {
+    "id": {"type": "str", "mandatory": False, "index": True},
+    "name": {"type": "str", "mandatory": True, "index": True},
+    "age": {"type": "int", "mandatory": False, "default": 0, "index": True},
+    "flags": {
+        "type": "object",
+        "fields": {
+            "active": {"type": "bool", "mandatory": False, "default": True, "index": True},
+        },
+    },
+    "createdAt": {"type": "datetime", "mandatory": False, "index": True},
+}
+
+db = Database(path="demo.jsonl", schema=SCHEMA, mode="+")
+rec = db.new()
+rec["name"] = "Alice"
+rec["age"] = 33
+rec.save()
+
+loaded = db.get(rec.id)
+print("Loaded:", loaded)
+
+for r in db.find({"flags": {"active": True}, "age": {"$gte": 18}}):
+    print("Adult active:", r["name"], r["age"])
+```
+
+Run the example
+- python examples/quick_start.py
 
 Contributing
 - Development setup: run ./setup.sh to install dev extras, then ruff and pytest locally.
