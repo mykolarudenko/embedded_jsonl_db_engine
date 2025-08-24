@@ -384,6 +384,10 @@ class Database:
                             terms.append(("/".join(new_base), "$lt", v["$lt"]))
                         if "$lte" in v:
                             terms.append(("/".join(new_base), "$lte", v["$lte"]))
+                        if "$in" in v:
+                            terms.append(("/".join(new_base), "$in", v["$in"]))
+                        if "$nin" in v:
+                            terms.append(("/".join(new_base), "$nin", v["$nin"]))
                     else:
                         walk_terms(v, new_base)
                 else:
@@ -472,6 +476,10 @@ class Database:
                             return val < arg
                         if op == "$lte":
                             return val <= arg
+                        if op == "$in":
+                            return isinstance(arg, list) and (val in arg)
+                        if op == "$nin":
+                            return isinstance(arg, list) and (val not in arg)
                         return False
                     except Exception:
                         return False
@@ -479,19 +487,37 @@ class Database:
                     tp, pat = pat_map[path]
                     raw = extract_first(pat, line)
                     val = parse_val(tp, raw)
-                    # Normalize arg to same type
+                    # Normalize arg to same type (supports scalars and $in/$nin lists)
                     try:
-                        if tp == "int" and not isinstance(arg, int):
-                            arg = int(arg)
-                        elif tp == "float" and not isinstance(arg, (int, float)):
-                            arg = float(arg)
-                        elif tp in ("str", "datetime") and not isinstance(arg, str):
-                            arg = str(arg)
-                        elif tp == "bool" and not isinstance(arg, bool):
-                            if isinstance(arg, str):
-                                arg = (arg.lower() == "true")
-                            else:
-                                arg = bool(arg)
+                        if op in ("$in", "$nin") and isinstance(arg, list):
+                            coerced = []
+                            for av in arg:
+                                if tp == "int":
+                                    coerced.append(int(av))
+                                elif tp == "float":
+                                    coerced.append(float(av))
+                                elif tp in ("str", "datetime"):
+                                    coerced.append(str(av))
+                                elif tp == "bool":
+                                    if isinstance(av, str):
+                                        coerced.append(av.lower() == "true")
+                                    else:
+                                        coerced.append(bool(av))
+                                else:
+                                    coerced.append(av)
+                            arg = coerced
+                        else:
+                            if tp == "int" and not isinstance(arg, int):
+                                arg = int(arg)
+                            elif tp == "float" and not isinstance(arg, (int, float)):
+                                arg = float(arg)
+                            elif tp in ("str", "datetime") and not isinstance(arg, str):
+                                arg = str(arg)
+                            elif tp == "bool" and not isinstance(arg, bool):
+                                if isinstance(arg, str):
+                                    arg = (arg.lower() == "true")
+                                else:
+                                    arg = bool(arg)
                     except Exception:
                         matched = False
                         break
@@ -1307,6 +1333,22 @@ class Database:
                     except Exception:
                         pass
                 self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
+            # Retention: keep only last N daily backups
+            daily_keep = int(backup_conf.get("daily_keep", 7))
+            try:
+                all_files = sorted(os.listdir(daily_dir))
+                # match files of this DB only
+                pat = re.compile(re.escape(base) + r"\.\d{4}-\d{2}-\d{2}\.jsonl\.gz\Z")
+                own_files = [f for f in all_files if pat.match(f)]
+                if len(own_files) > daily_keep:
+                    to_delete = own_files[:-daily_keep]
+                    for fn in to_delete:
+                        try:
+                            os.remove(os.path.join(daily_dir, fn))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         else:
             raise ValidationError(f"Unknown backup kind: {kind!r}")
 
