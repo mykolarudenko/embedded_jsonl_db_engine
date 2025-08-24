@@ -1,5 +1,4 @@
 import json
-import os
 import pytest
 from embedded_jsonl_db_engine import Database
 from embedded_jsonl_db_engine.errors import IOCorruptionError
