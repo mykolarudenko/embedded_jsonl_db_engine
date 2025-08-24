@@ -1106,8 +1106,27 @@ class Database:
             for obj in header_lines:
                 dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-            # Copy and transform live records by timestamp order
-            live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
+            # Build live entries by streaming meta (self._index is not built yet on fresh open)
+            live_map: Dict[str, MetaEntry] = {}
+            for offset, mline in self._fs.iter_meta_offsets():
+                try:
+                    m = json.loads(mline)
+                except Exception:
+                    continue
+                if m.get("_t") != "meta":
+                    continue
+                rid = m.get("id")
+                if not isinstance(rid, str) or not rid:
+                    continue
+                op = m.get("op")
+                ts_iso = m.get("ts") or now_iso()
+                ts_ms = iso_to_epoch_ms(ts_iso)
+                off_data = offset + len(mline.encode("utf-8")) if op == "put" else None
+                live_map[rid] = MetaEntry(
+                    id=rid, offset_meta=offset, offset_data=off_data, deleted=(op == "del"), ts_ms=ts_ms
+                )
+
+            live_entries = [e for e in live_map.values() if (not e.deleted) and (e.offset_data is not None)]
             live_entries.sort(key=lambda e: e.ts_ms)
             total = len(live_entries)
             for i, e in enumerate(live_entries, 1):
