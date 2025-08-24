@@ -1,6 +1,8 @@
 import re
 from typing import Pattern
 
+# Упрощённые паттерны для извлечения значений по JSON-пути.
+# Важно: это быстрый эвристический путь, он не покрывает все углы JSON.
 _STR = r'"(?:(?:[^"\\]|\\.)*)"'
 _INT = r'-?\d+'
 _FLOAT = r'-?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?'
@@ -18,17 +20,29 @@ def _val_pattern(tp: str) -> str:
     raise ValueError(f"Unsupported scalar type for fast regex: {tp}")
 
 def compile_path_pattern(path: str, tp: str) -> Pattern[str]:
+    """
+    Компилирует regex для поиска значения на пути "a/b/c" в одной JSON-строке.
+    Ключи экранируются через re.escape. Между сегментами допускаются пробелы/переносы.
+    """
     parts = [p for p in path.split("/") if p]
-    segs = []
+    segs: list[str] = []
     for i, key in enumerate(parts):
+        k = re.escape(key)
         if i < len(parts) - 1:
-            segs.append(rf'"{re.escape(key)}"\s*:\s*\{{\s*')
+            # "key"\s*:\s*{  (вложенный объект)
+            segs.append(rf'"{k}"\s*:\s*\{{\s*')
         else:
-            segs.append(rf'"{re.escape(key)}"\s*:\s*({_val_pattern(tp)})')
+            # "key"\s*:\s*(<VAL>)
+            segs.append(rf'"{k}"\s*:\s*({_val_pattern(tp)})')
     pat = "".join(segs)
+    # DOTALL — чтобы . покрывало переводы строк; IGNORECASE не нужен
     return re.compile(pat, re.DOTALL)
 
 def extract_first(pattern: Pattern[str], data_line: str) -> str | None:
+    """
+    Возвращает строковое представление первого найденного значения (как в исходной JSON-строке),
+    либо None, если не найдено.
+    """
     m = pattern.search(data_line)
     if not m:
         return None
