@@ -2,8 +2,11 @@ import time
 from embedded_jsonl_db_engine import Database
 from rich.console import Console
 import sys
+import os
 
-_console = Console(file=sys.stderr, force_terminal=True, color_system="standard")
+_force_tty = os.environ.get("FORCE_TTY", "").lower() in ("1", "true", "yes", "on")
+_isatty = getattr(sys.stderr, "isatty", lambda: False)()
+_console = Console(file=sys.stderr, force_terminal=(_isatty or _force_tty), color_system="standard")
 
 def progress_printer(evt):
     phase = evt.get("phase", "")
