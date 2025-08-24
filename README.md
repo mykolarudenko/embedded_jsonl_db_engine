@@ -4,6 +4,10 @@ Embedded, single-file JSONL database with typed schema and taxonomies in the fil
 
 Status: alpha. Core features implemented: file I/O, in-memory indexes, CRUD, compaction, backups, taxonomy header + migrations, external BLOBs. Fast-regex plan is integrated for simple queries; complex queries fall back to full parse.
 
+Test status
+- Full test suite is expected to pass locally (CRUD, queries, performance, backups retention, corruption handling, schema migration, taxonomy ops, blobs GC).
+- Run: ./run-tests.sh
+
 Install
 - pip install embedded_jsonl_db_engine
 
