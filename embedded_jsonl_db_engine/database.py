@@ -86,6 +86,7 @@ class Database:
     ) -> None:
         self.path = path
         self._schema = Schema(schema)
+        self._target_schema_fields: Dict[str, Any] = json.loads(json.dumps(schema))
         self._taxonomies: Dict[str, Any] = { }
         self._fs = FileStorage(path)
         self._progress = Progress(on_progress)
@@ -117,6 +118,12 @@ class Database:
             # Keep taxonomies from file (schema migration is out of scope here)
             self._header = _hdr
             self._taxonomies = taxonomies or {}
+            # If target schema differs from on-disk, run migration to target
+            on_disk = _schema_fields
+            if canonical_json(on_disk) != canonical_json(self._target_schema_fields):
+                self._progress.emit("schema.migrate", 0, msg="Migrating schema")
+                self._migrate_schema_to(self._target_schema_fields)
+                return
             # Align schema to on-disk schema and recompute index specs
             self._schema = Schema(_schema_fields)
             self._compute_index_specs()
@@ -1048,6 +1055,72 @@ class Database:
 
         self._fs.replace_file(tmp_path)
         self._open("+")
+
+    def _migrate_schema_to(self, new_fields: Dict[str, Any]) -> None:
+        """
+        Full-file rewrite to switch schema to new_fields.
+        Applies defaults of the new schema and validates each record.
+        """
+        self._progress.emit("schema.migrate", 0, msg="Starting schema migration")
+        sch_new = Schema(new_fields)
+
+        # Close handle to avoid writing to unlinked inode during replace
+        self._fs.close()
+
+        tmp_path = f"{self.path}.schemamigrate.tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+            # Write header with updated schema
+            header_lines = [
+                {"_t": "header", **self._header},
+                {"_t": "schema", "fields": new_fields},
+                {"_t": "taxonomies", "items": self._taxonomies},
+                {"_t": "begin"},
+            ]
+            for obj in header_lines:
+                dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+            # Copy and transform live records by timestamp order
+            live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
+            live_entries.sort(key=lambda e: e.ts_ms)
+            total = len(live_entries)
+            for i, e in enumerate(live_entries, 1):
+                line = self._fs.read_line_at(e.offset_data)
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                # Apply defaults of new schema and validate
+                sch_new.apply_defaults(obj)
+                sch_new.validate(obj)
+
+                data_str = canonical_json(obj)
+                data_bytes = data_str.encode("utf-8")
+                ts_iso = now_iso()
+                meta_obj = {
+                    "_t": "meta",
+                    "id": e.id,
+                    "op": "put",
+                    "ts": ts_iso,
+                    "len_data": len(data_bytes),
+                    "sha256_data": sha256_hex(data_bytes),
+                }
+                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                dst.write(data_str + "\n")
+                self._progress.emit("schema.migrate", int(i * 100 / max(1, total)), migrated=i, total=total)
+
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except Exception:
+                pass
+
+        # Replace file and reopen (will rebuild indexes against the new schema)
+        self._fs.replace_file(tmp_path)
+        # Update in-memory schema to the new one for subsequent operations
+        self._schema = Schema(new_fields)
+        self._compute_index_specs()
+        self._open("+")
+        self._progress.emit("schema.migrate", 100, msg="Schema migration complete")
 
     def compact_now(self) -> None:
         """
