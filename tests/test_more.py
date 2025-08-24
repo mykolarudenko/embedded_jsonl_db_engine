@@ -151,7 +151,8 @@ def test_taxonomy_merge_and_delete(tmp_path):
 
     # Delete target (detach)
     tx.delete("target", strategy="detach")
-    g1 = db.get(r1.id); g2 = db.get(r2.id)
+    g1 = db.get(r1.id)
+    g2 = db.get(r2.id)
     assert g1 is not None and g2 is not None
     assert "target" not in g1.get("categories", []) and "target" not in g2.get("categories", [])
     got2 = list(db.find({"categories": {"$contains": "target"}}))
