@@ -19,17 +19,18 @@ set -euo pipefail
 fail() { echo "[release] ERROR: $*" >&2; exit 1; }
 info() { echo "[release] $*"; }
 
-# Accept version either as arg or from RELEASE_VERSION env var
-if [[ $# -gt 1 ]]; then
-  fail "Usage: scripts/release.sh [<version>] or set RELEASE_VERSION env var"
-fi
+# Set release version INSIDE the script (single source of truth for manual releases)
+# To change version, edit the line below and commit:
+VERSION="0.1.0a3"
 
+# Still allow overriding via explicit CLI arg or RELEASE_VERSION env if absolutely needed.
+if [[ $# -gt 1 ]]; then
+  fail "Usage: scripts/release.sh [<version>] (optional) or set RELEASE_VERSION env var"
+fi
 if [[ $# -eq 1 ]]; then
   VERSION="$1"
 elif [[ -n "${RELEASE_VERSION:-}" ]]; then
   VERSION="$RELEASE_VERSION"
-else
-  fail "Provide version as argument or set RELEASE_VERSION env var, e.g.: RELEASE_VERSION=0.1.0a3 scripts/release.sh"
 fi
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc][0-9]+)?$ ]]; then
