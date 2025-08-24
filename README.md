@@ -6,6 +6,7 @@ Status: alpha. Core features implemented: file I/O, in-memory indexes, CRUD, com
 
 Test status
 - Full test suite passes locally (CRUD, queries, performance, backups retention, corruption handling, schema migration, taxonomy ops, blobs GC).
+- Note on parallelism: current engine favors simplicity and deterministic ordering; regex fast-path and index build operate single-threaded to avoid GIL/IPC overhead. Parallel scan/parse across CPU cores can be added later via multiprocessing if workloads demand it.
 - Run: ./run-tests.sh
 - Reference run (on Dev machine):
   - 21 passed in ~9s
