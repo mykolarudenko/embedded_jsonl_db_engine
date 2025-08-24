@@ -1,8 +1,9 @@
 import os
+import sys
 from embedded_jsonl_db_engine import Database
 from rich.console import Console
 
-_console = Console(force_terminal=True, color_system="standard")
+_console = Console(file=sys.stderr, force_terminal=True, color_system="standard")
 
 def progress_printer(evt):
     phase = evt.get("phase", "")
@@ -11,19 +12,24 @@ def progress_printer(evt):
     state = getattr(progress_printer, "_state", {"last": {}})
     last = state["last"]
     prev = last.get(phase, -1)
-    # Throttle: print first event, then every 5% step, and always at 100%
+
+    is_tty = getattr(_console, "is_terminal", False)
+
+    # Non-TTY (pytest logs, CI): print only start and completion to avoid noisy multi-lines
+    if not is_tty:
+        if pct in (0, 100) and (prev != pct):
+            parts = [p for p in (phase, f"{pct}%", (f"- {msg}" if msg else "")) if p]
+            _console.print("[progress] " + " ".join(parts))
+        last[phase] = pct
+        progress_printer._state = state
+        return
+
+    # TTY: update same line; throttle to every 5% + always 100%
     if pct < 100 and prev != -1 and (pct - prev) < 5:
         return
-    parts = []
-    if phase:
-        parts.append(phase)
-    parts.append(f"{pct}%")
-    # Only show long message at edges to reduce noise
-    if msg and pct in (0, 100):
-        parts.append(f"- {msg}")
-    text = f"[progress] {' '.join(parts)}"
-    # Clear current line and rewrite
-    _console.print("\r\x1b[2K" + text, end="", highlight=False, soft_wrap=False)
+    parts = [p for p in (phase, f"{pct}%", (f"- {msg}" if (msg and pct in (0, 100)) else "")) if p]
+    text = "[progress] " + " ".join(parts)
+    _console.print("\r\x1b[2K" + text, end="")
     if pct >= 100:
         _console.print()
     last[phase] = pct
