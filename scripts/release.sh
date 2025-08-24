@@ -4,13 +4,13 @@
 #   scripts/release.sh 0.1.0a3
 # Actions:
 #   - validate clean git state (except untracked ignored files)
-#   - bump version in pyproject.toml
+#   - bump version in pyproject.toml (works from any subdir)
 #   - commit with conventional message
 #   - create and push tag v<version>
 #   - push main branch
 #
 # Notes:
-#   - Requires: bash, git, sed, grep
+#   - Requires: bash, git, sed, grep, awk
 #   - Does NOT touch .env or any secrets.
 #   - Prints clear hints if something is missing.
 
@@ -28,12 +28,16 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc][0-9]+)?$ ]]; then
   fail "Version must look like 1.2.3 or 1.2.3a1/b1/rc1. Got: $VERSION"
 fi
 
-# Check that required files exist
-[[ -f "pyproject.toml" ]] || fail "pyproject.toml not found"
-[[ -f ".github/workflows/publish.yml" ]] || fail ".github/workflows/publish.yml not found"
-
-# Ensure we are on a git repo
+# Ensure we are on a git repo and determine repo root
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not inside a git repository"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Work from repo root regardless of current dir
+cd "$REPO_ROOT"
+
+# Check that required files exist
+[[ -f "pyproject.toml" ]] || fail "pyproject.toml not found in repo root: $REPO_ROOT"
+[[ -f ".github/workflows/publish.yml" ]] || fail ".github/workflows/publish.yml not found"
 
 # Ensure working tree is clean (ignoring untracked files)
 if ! git diff --quiet --ignore-submodules --; then
@@ -48,8 +52,7 @@ if ! grep -qE '^version = "' pyproject.toml; then
   fail 'Cannot find version = "..." in pyproject.toml'
 fi
 
-# Use sed portable-ish replacement for the version line
-# This replaces the first occurrence of version = "...".
+# Use awk replacement for the version line (first occurrence)
 tmp_file="$(mktemp)"
 awk -v newv="$VERSION" '
   BEGIN { done=0 }
@@ -63,7 +66,6 @@ awk -v newv="$VERSION" '
 ' pyproject.toml > "$tmp_file"
 mv "$tmp_file" pyproject.toml
 
-# Show diff for confirmation
 info "Bumped version in pyproject.toml to $VERSION"
 
 # Commit and tag
