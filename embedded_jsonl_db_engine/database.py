@@ -110,6 +110,7 @@ class Database:
         """
         # Acquire lock/open
         self._fs.open_exclusive(mode)
+        # Emit only once per phase to keep single-line progress per process
         self._progress.emit("open.start", 0, path=self.path)
 
         # Ensure header exists; if not, initialize a new header using provided schema
@@ -179,9 +180,11 @@ class Database:
                 if last_pct == -1 or pct - last_pct >= 5 or pct == 99:
                     self._progress.emit("open.scan_meta", pct, scanned=scanned, bytes_done=offset, bytes_total=total_bytes)
                     last_pct = pct
+        # Finish scan phase once
         self._progress.emit("open.scan_meta", 100, scanned=scanned)
 
         # Build secondary & reverse indexes from live records
+        # Build indexes once for this open cycle
         self._progress.emit("open.build_indexes", 0, total=len(self._index.meta))
         self._build_indexes_on_open()
         self._progress.emit("open.done", 100, msg="Open complete")
@@ -800,6 +803,7 @@ class Database:
                 built += 1
                 if built % 100 == 0:
                     self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
+            # Emit final progress once
             self._progress.emit("open.build_indexes", 100, built=built)
             return
 
@@ -818,6 +822,7 @@ class Database:
             built += 1
             if built % 100 == 0:
                 self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
+        # Emit final progress once for fallback path
         self._progress.emit("open.build_indexes", 100, built=built)
 
     def _extract_at_path(self, obj: Dict[str, Any], path: str):
