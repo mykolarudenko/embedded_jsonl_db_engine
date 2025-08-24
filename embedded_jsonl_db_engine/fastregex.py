@@ -3,6 +3,16 @@ from typing import Pattern
 
 # Упрощённые паттерны для извлечения значений по JSON-пути.
 # Важно: это быстрый эвристический путь, он не покрывает все углы JSON.
+# Где и как используется (eng):
+# - In Database._build_indexes_on_open() fast path compiles one regex per scalar index path
+#   and extracts values directly from JSON lines to populate secondary indexes, avoiding json.loads.
+# - In Database.find(), when is_simple_query(query) is True, we compile regex patterns for the
+#   referenced scalar paths and extract values to pre-check predicates. This reduces the number
+#   of full JSON parses to only records that already matched fast checks or require projection.
+# - Cost model:
+#   • compile_path_pattern(): O(len(path)) compile once per distinct path per process.
+#   • extract_first(): O(len(line)) search with DOTALL regex, typically dominated by JSON line length.
+#   • parse of matched scalar is trivial (int/float/bool via cast; str via json.loads on the token).
 _STR = r'"(?:(?:[^"\\]|\\.)*)"'
 _INT = r'-?\d+'
 _FLOAT = r'-?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?'
