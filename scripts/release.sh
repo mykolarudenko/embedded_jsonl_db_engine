@@ -48,35 +48,25 @@ cd "$REPO_ROOT"
 [[ -f "pyproject.toml" ]] || fail "pyproject.toml not found in repo root: $REPO_ROOT"
 [[ -f ".github/workflows/publish.yml" ]] || fail ".github/workflows/publish.yml not found"
 
-# Ensure working tree is clean (ignoring untracked files).
-# Auto-commit only tracked project files; explicitly exclude .aider* and other local artifacts.
-AIDER_EXCLUDES=(
-  ":(exclude).aider*"
-  ":(exclude).aider.tags.cache.v4/"
-  ":(exclude).aider.chat.history.md"
-  ":(exclude).aider.input.history"
-)
-
-# Unstaged changes in tracked files (excluding aider artifacts)
-if ! git diff --quiet --ignore-submodules -- . "${AIDER_EXCLUDES[@]}"; then
-  info "Working tree has unstaged changes (excluding local aide artifacts)."
+# Ensure working tree is clean.
+# Respect .gitignore strictly: do NOT auto-add untracked files at all.
+# Only commit already tracked files that have modifications.
+if ! git diff --quiet --ignore-submodules --; then
+  info "Working tree has unstaged changes in tracked files."
   if [[ "${AUTO_COMMIT_DIRTY:-1}" == "1" ]]; then
-    info "Auto-committing tracked changes (set AUTO_COMMIT_DIRTY=0 to disable)"
-    git add -A -- . "${AIDER_EXCLUDES[@]}"
-    # Ensure we don't accidentally add excluded patterns
-    git reset --quiet -- "${AIDER_EXCLUDES[@]}" || true
+    info "Auto-committing tracked changes only (untracked files are ignored per .gitignore)"
+    # Stage only modified/deleted tracked files, do not add untracked files:
+    git add -u
     git commit -m "chore(pre-release): commit pending changes before release $VERSION"
   else
     fail "Working tree has unstaged changes. Commit or stash them before releasing."
   fi
 fi
 
-# Staged but uncommitted changes (excluding aider artifacts)
-if ! git diff --cached --quiet --ignore-submodules -- . "${AIDER_EXCLUDES[@]}"; then
-  info "Index has staged but uncommitted changes (excluding local aide artifacts)."
+# Staged but uncommitted changes
+if ! git diff --cached --quiet --ignore-submodules --; then
+  info "Index has staged but uncommitted changes."
   if [[ "${AUTO_COMMIT_DIRTY:-1}" == "1" ]]; then
-    # Ensure excluded files not staged
-    git reset --quiet -- "${AIDER_EXCLUDES[@]}" || true
     git commit -m "chore(pre-release): commit staged changes before release $VERSION"
   else
     fail "Index has staged changes. Commit or reset them before releasing."
