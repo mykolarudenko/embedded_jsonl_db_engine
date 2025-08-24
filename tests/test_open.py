@@ -2,7 +2,7 @@ import os
 from embedded_jsonl_db_engine import Database
 from rich.console import Console
 
-_console = Console()
+_console = Console(force_terminal=True, color_system="standard")
 
 def progress_printer(evt):
     phase = evt.get("phase", "")
