@@ -800,6 +800,7 @@ class Database:
                 built += 1
                 if built % 100 == 0:
                     self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
+            self._progress.emit("open.build_indexes", 100, built=built)
             return
 
         # Fallback: need full JSON to process list-based taxonomy memberships
@@ -817,6 +818,7 @@ class Database:
             built += 1
             if built % 100 == 0:
                 self._progress.emit("open.build_indexes", int(built * 100 / max(1, total)), built=built)
+        self._progress.emit("open.build_indexes", 100, built=built)
 
     def _extract_at_path(self, obj: Dict[str, Any], path: str):
         cur: Any = obj
