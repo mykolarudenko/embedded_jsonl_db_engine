@@ -17,6 +17,11 @@ Test status
 Install
 - pip install embedded_jsonl_db_engine
 
+Release to PyPI
+- Build: python -m build
+- Publish (test): twine upload --repository testpypi dist/*
+- Publish (prod): twine upload dist/*
+
 Quick start
 - See docs in package and upcoming examples.
 

@@ -6,7 +6,29 @@ authors = [{ name = "Mykola Rudenko" }]
 requires-python = ">=3.9"
 readme = "README.md"
 license = { text = "MIT" }
+keywords = ["jsonl", "embedded", "database", "single-file", "schema", "taxonomies", "regex", "blobs"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/your-org/embedded_jsonl_db_engine"
+Repository = "https://github.com/your-org/embedded_jsonl_db_engine"
+Issues = "https://github.com/your-org/embedded_jsonl_db_engine/issues"
 
 [project.optional-dependencies]
 ijson = ["ijson"]
@@ -14,3 +36,16 @@ dev = ["mypy", "ruff", "pytest", "pytest-cov", "rich"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["embedded_jsonl_db_engine*"]
+exclude = ["tests*", "examples*", "docs*", "scripts*"]
