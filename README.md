@@ -1,12 +1,17 @@
 # Embedded JSONL DB Engine
 
-Embedded, single-file JSONL database with typed schema and taxonomies in the file header. In-memory indexes on open, fast regex plan for simple predicates, full JSON parse otherwise. Single-writer model with explicit compaction, rolling & daily backups, and external BLOB storage.
+Human-readable and human-editable storage for serializable objects. A single JSONL file acts as a database with a typed schema and taxonomies stored in the header. Appends-only write model means you don't rewrite the whole file on every change. The schema exists but can evolve freely: add new fields at any time, and the database will self-adapt by materializing defaults and preserving existing data without manual migrations. For simple predicates we use a fast regex plan; otherwise we fall back to full JSON parsing. Single-writer model with explicit compaction, rolling & daily backups, and external BLOB storage.
 
 Status: alpha. Core features implemented: file I/O, in-memory indexes, CRUD, compaction, backups, taxonomy header + migrations, external BLOBs. Fast-regex plan is integrated for simple queries; complex queries fall back to full parse.
 
 Test status
-- Full test suite is expected to pass locally (CRUD, queries, performance, backups retention, corruption handling, schema migration, taxonomy ops, blobs GC).
+- Full test suite passes locally (CRUD, queries, performance, backups retention, corruption handling, schema migration, taxonomy ops, blobs GC).
 - Run: ./run-tests.sh
+- Reference run (on Dev machine):
+  - 21 passed in ~9s
+  - reopen and build indexes for 10000 records: ~0.47s
+  - fast-plan query (>= 5000) matched=5000: ~0.63s
+  - full-parse query (same predicate via $or) matched=5000: ~0.72s
 
 Install
 - pip install embedded_jsonl_db_engine
