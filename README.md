@@ -71,5 +71,7 @@ What has been implemented so far
 - BLOBs: external CAS by sha256 with put/open/gc and Database wrappers.
 - Utilities: ISO timestamps, epoch converters, canonical JSON, sha256, ULID-like ids.
 
+  [![PyPI Downloads](https://static.pepy.tech/badge/embedded-jsonl-db-engine)](https://pepy.tech/projects/embedded-jsonl-db-engine)
+
 License
 MIT
