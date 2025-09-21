@@ -3,6 +3,7 @@ import io
 import os
 import json
 from typing import Dict, Iterator, Tuple
+import time
 from .errors import LockError, IOCorruptionError
 
 HEADER_T = "header"
@@ -18,12 +19,18 @@ class FileStorage:
     def __init__(self, path: str) -> None:
         self.path = path
         self._fh: io.TextIOWrapper | None = None
+        # Legacy field kept for backward compatibility; not used for process lock anymore
         self._lock_impl: str | None = None
+        # Process-level locking state (uses separate .lock file)
+        self._lock_fh: io.TextIOWrapper | None = None
+        self._plock_impl: str | None = None
+        self._lock_mode: str | None = None  # "read" | "write" | "maint"
+        self._lock_depth: int = 0
 
     def open_exclusive(self, mode: str = "+") -> None:
         """
-        Open file and acquire an exclusive lock (non-blocking).
-        mode: "+" for write-intent, otherwise read-only lock (still EX for simplicity).
+        Open the DB file handle. No process-level locking here.
+        Process-level locks are managed per-operation via acquire_lock()/release_lock().
         """
         if self._fh is not None:
             return
@@ -33,54 +40,117 @@ class FileStorage:
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
         self._fh = open(self.path, file_mode, encoding="utf-8", newline="\n")
+        # Normalize pointer to BOF for subsequent reads
         try:
-            try:
-                import fcntl  # type: ignore
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._lock_impl = "fcntl"
-            except Exception:
-                # Try Windows msvcrt
-                try:
-                    import msvcrt  # type: ignore
-                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    self._lock_impl = "msvcrt"
-                except Exception as e:
-                    try:
-                        self._fh.close()
-                    finally:
-                        self._fh = None
-                    raise LockError(f"failed to acquire exclusive lock: {e}") from e
-        finally:
-            if self._fh:
-                # Normalize pointer to BOF for subsequent reads
-                try:
-                    self._fh.seek(0)
-                except Exception:
-                    pass
+            self._fh.seek(0)
+        except Exception:
+            pass
 
     def close(self) -> None:
         """
-        Release lock and close file handle.
+        Close DB file handle (process-level lock is managed separately).
         """
         if not self._fh:
             return
         try:
-            if self._lock_impl == "fcntl":
+            self._fh.close()
+        finally:
+            self._fh = None
+            self._lock_impl = None
+
+    # ----- Process-level locking (per operation) -----
+
+    def acquire_lock(self, kind: str, attempts: int, sleep_ms: int, allow_shared_read: bool = True) -> bool:
+        """
+        Acquire a process-level lock on a separate .lock file.
+        kind: "read" (shared if supported), "write" (exclusive), "maint" (exclusive).
+        Returns True on success, False if attempts exhausted.
+        Nested acquisitions are reference-counted.
+        """
+        if self._lock_depth > 0:
+            # Nested acquisition within the same process/thread
+            self._lock_depth += 1
+            return True
+
+        lock_path = self.path + ".lock"
+        # Ensure lock file exists
+        parent = os.path.dirname(os.path.abspath(lock_path))
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        # Open lock file handle
+        self._lock_fh = open(lock_path, "a+", encoding="utf-8", newline="\n")
+
+        mode = "write" if kind in ("write", "maint") else "read"
+        self._lock_mode = mode
+
+        # Try POSIX flock shared/exclusive first
+        last_err: Exception | None = None
+        for _ in range(max(1, int(attempts))):
+            try:
+                try:
+                    import fcntl  # type: ignore
+                    flags = fcntl.LOCK_EX | fcntl.LOCK_NB
+                    if mode == "read" and allow_shared_read:
+                        flags = fcntl.LOCK_SH | fcntl.LOCK_NB
+                    fcntl.flock(self._lock_fh.fileno(), flags)
+                    self._plock_impl = "fcntl"
+                    self._lock_depth = 1
+                    return True
+                except Exception as e_fcntl:
+                    last_err = e_fcntl
+                    # Try Windows fallback
+                    try:
+                        import msvcrt  # type: ignore
+                        # msvcrt has no shared variant; lock 1 byte exclusively
+                        msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        self._plock_impl = "msvcrt"
+                        self._lock_depth = 1
+                        return True
+                    except Exception as e_win:
+                        last_err = e_win
+            except Exception as e:
+                last_err = e
+            time.sleep(max(0, int(sleep_ms)) / 1000.0)
+
+        # Failed to acquire
+        try:
+            if self._lock_fh:
+                self._lock_fh.close()
+        finally:
+            self._lock_fh = None
+            self._plock_impl = None
+            self._lock_mode = None
+            self._lock_depth = 0
+        return False
+
+    def release_lock(self) -> None:
+        """
+        Release the process-level lock if held (supports nested acquisitions).
+        """
+        if self._lock_depth <= 0:
+            return
+        self._lock_depth -= 1
+        if self._lock_depth > 0:
+            return
+        try:
+            if self._plock_impl == "fcntl":
                 import fcntl  # type: ignore
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-            elif self._lock_impl == "msvcrt":
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)  # type: ignore[arg-type]
+            elif self._plock_impl == "msvcrt":
                 import msvcrt  # type: ignore
                 try:
-                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[arg-type]
                 except OSError:
-                    # Best-effort unlock on Windows; ignore if file already closed/rotated
                     pass
         finally:
             try:
-                self._fh.close()
+                if self._lock_fh:
+                    self._lock_fh.close()
             finally:
-                self._fh = None
-                self._lock_impl = None
+                self._lock_fh = None
+                self._plock_impl = None
+                self._lock_mode = None
+                self._lock_depth = 0
 
     # ----- Header / schema / taxonomies -----
 
@@ -183,38 +253,75 @@ class FileStorage:
             pass
         return offset_meta, offset_data
 
-    def iter_meta_offsets(self) -> Iterator[Tuple[int, str]]:
+    def iter_meta_offsets(self, attempts: int = 1, sleep_ms: int = 0) -> Iterator[Tuple[int, str]]:
         """
         Stream-scan file and yield (offset, meta_line_str) for each meta line.
+        If the tail line is incomplete (no trailing newline), retry reading the tail
+        up to `attempts` times with `sleep_ms` pauses to avoid truncated reads.
+        A process-level read lock is held during the scan.
         """
-        # Read via separate binary handle to avoid disturbing main fh position
         if not os.path.exists(self.path):
             return
-        with open(self.path, "rb") as fh:
-            # Skip header (4 lines)
-            for _ in range(4):
-                if not fh.readline():
-                    return
-            while True:
-                offset = fh.tell()
-                line = fh.readline()
-                if not line:
-                    break
-                if line.startswith(b'{"_t":"meta"'):
-                    try:
-                        yield offset, line.decode("utf-8")
-                    except UnicodeDecodeError:
-                        # Fallback replacement to avoid breaking scan
-                        yield offset, line.decode("utf-8", errors="replace")
+        # Hold a read lock for the duration of the scan
+        if not self.acquire_lock("read", attempts=max(1, attempts), sleep_ms=max(0, sleep_ms), allow_shared_read=True):
+            # If lock cannot be acquired, just return (caller may retry)
+            return
+        try:
+            with open(self.path, "rb") as fh:
+                # Skip header (4 lines)
+                for _ in range(4):
+                    if not fh.readline():
+                        return
+                while True:
+                    offset = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        # Tail might be incomplete; retry a few times
+                        ok = False
+                        for _ in range(max(1, attempts)):
+                            time.sleep(max(0, sleep_ms) / 1000.0)
+                            fh.seek(offset)
+                            line = fh.readline()
+                            if not line or line.endswith(b"\n"):
+                                ok = True
+                                break
+                        if not ok:
+                            # Give up on tail; stop iteration without error
+                            break
+                    if line.startswith(b'{"_t":"meta"'):
+                        try:
+                            yield offset, line.decode("utf-8")
+                        except UnicodeDecodeError:
+                            # Fallback replacement to avoid breaking scan
+                            yield offset, line.decode("utf-8", errors="replace")
+        finally:
+            self.release_lock()
 
-    def read_line_at(self, offset: int) -> str:
+    def read_line_at(self, offset: int, attempts: int = 1, sleep_ms: int = 0) -> str:
         """
         Read one line at absolute byte offset and return as str (utf-8).
+        If the line is incomplete (no trailing newline), retry a few times.
+        A process-level read lock is acquired for the duration of the call.
+        Returns empty string if the line could not be read completely.
         """
-        with open(self.path, "rb") as fh:
-            fh.seek(offset)
-            line = fh.readline()
-            return line.decode("utf-8")
+        if not self.acquire_lock("read", attempts=max(1, attempts), sleep_ms=max(0, sleep_ms), allow_shared_read=True):
+            return ""
+        try:
+            for _ in range(max(1, attempts)):
+                with open(self.path, "rb") as fh:
+                    fh.seek(offset)
+                    line = fh.readline()
+                if not line:
+                    time.sleep(max(0, sleep_ms) / 1000.0)
+                    continue
+                if line.endswith(b"\n"):
+                    return line.decode("utf-8")
+                time.sleep(max(0, sleep_ms) / 1000.0)
+            return ""
+        finally:
+            self.release_lock()
 
     def replace_file(self, tmp_path: str) -> None:
         """

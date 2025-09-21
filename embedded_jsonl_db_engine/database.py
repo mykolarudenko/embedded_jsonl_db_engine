@@ -5,6 +5,9 @@ import re
 import io
 import gzip
 import shutil
+import threading
+import time
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from .schema import Schema
 from .taxonomy import TaxonomyAPI
@@ -15,10 +18,50 @@ from .progress import Progress
 from .fastregex import compile_path_pattern, extract_first
 from .query import is_simple_query
 from .utils import now_iso, canonical_json, sha256_hex, new_ulid, iso_to_epoch_ms
-from .errors import ValidationError, ConflictError, IOCorruptionError, DuplicateIdError, SchemaError
+from .errors import ValidationError, ConflictError, IOCorruptionError, DuplicateIdError, SchemaError, LockError
 
 # Scalar types used for building secondary indexes
 _SCALAR_TYPES = {"str", "int", "float", "bool", "datetime"}
+
+class Options:
+    """
+    Runtime options controlling lock retries and read-tail safety.
+    """
+    def __init__(
+        self,
+        process_lock_attempts: int = 40,
+        process_lock_sleep_ms: int = 50,
+        read_tail_retry_attempts: int = 40,
+        read_tail_sleep_ms: int = 50,
+        maintenance_attempts: int = 40,
+        maintenance_sleep_ms: int = 50,
+        allow_shared_read: bool = True,
+    ) -> None:
+        self.process_lock_attempts = int(process_lock_attempts)
+        self.process_lock_sleep_ms = int(process_lock_sleep_ms)
+        self.read_tail_retry_attempts = int(read_tail_retry_attempts)
+        self.read_tail_sleep_ms = int(read_tail_sleep_ms)
+        self.maintenance_attempts = int(maintenance_attempts)
+        self.maintenance_sleep_ms = int(maintenance_sleep_ms)
+        self.allow_shared_read = bool(allow_shared_read)
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> "Options":
+        if d is None:
+            return cls()
+        if isinstance(d, cls):
+            return d  # type: ignore[return-value]
+        if not isinstance(d, dict):
+            return cls()
+        return cls(
+            process_lock_attempts=int(d.get("process_lock_attempts", 40)),
+            process_lock_sleep_ms=int(d.get("process_lock_sleep_ms", 50)),
+            read_tail_retry_attempts=int(d.get("read_tail_retry_attempts", 40)),
+            read_tail_sleep_ms=int(d.get("read_tail_sleep_ms", 50)),
+            maintenance_attempts=int(d.get("maintenance_attempts", 40)),
+            maintenance_sleep_ms=int(d.get("maintenance_sleep_ms", 50)),
+            allow_shared_read=bool(d.get("allow_shared_read", True)),
+        )
 
 class TDBRecord(dict):
     """
@@ -83,6 +126,7 @@ class Database:
         mode: str = "+",
         on_progress = None,
         maintenance: Optional[Dict[str, Any]] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.path = path
         self._schema = Schema(schema)
@@ -93,6 +137,11 @@ class Database:
         self._index = InMemoryIndex()
         self._maintenance = maintenance or {}
         self._header: Dict[str, Any] = {}
+        # Runtime options and intra-process locks
+        self.options = Options.from_dict(options)
+        self._maint_lock = threading.Lock()
+        self._maint_active = False
+        self._write_lock = threading.RLock()
         # Precompute index specs from schema hints
         self._sec_paths: List[str] = []
         self._rev_list_paths: List[Tuple[str, str]] = []
@@ -106,17 +155,40 @@ class Database:
 
     def _open(self, mode: str) -> None:
         """
-        Open DB file: acquire lock, ensure header exists, scan meta to build in-memory index.
+        Open DB file: ensure header exists, scan meta to build in-memory index.
+        Uses per-operation process-level locks with retries.
         """
-        # Acquire lock/open
+        # Open file handle (no locking here)
         self._fs.open_exclusive(mode)
         # Emit only once per phase to keep single-line progress per process
         self._progress.emit("open.start", 0, path=self.path)
 
-        # Ensure header exists; if not, initialize a new header using provided schema
+        # Read header under read lock; initialize if missing
+        need_init = False
+        _hdr = {}
+        _schema_fields: Dict[str, Any] = {}
+        taxonomies: Dict[str, Any] = {}
         try:
-            _hdr, _schema_fields, taxonomies = self._fs.read_header_and_schema()
-            # Keep taxonomies from file (schema migration is out of scope here)
+            with self._process_lock("read"):
+                _hdr, _schema_fields, taxonomies = self._fs.read_header_and_schema()
+        except IOCorruptionError:
+            need_init = True
+
+        if need_init:
+            hdr = {
+                "format": "ejl1",
+                "table": os.path.splitext(os.path.basename(self.path))[0],
+                "created": now_iso(),
+                "defaults_always_materialized": True,
+            }
+            self._header = hdr
+            self._taxonomies = {}
+            # Write new header under write lock
+            with self._process_lock("write"):
+                self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
+            self._compute_index_specs()
+        else:
+            # Keep taxonomies from file (schema migration may be needed)
             self._header = _hdr
             self._taxonomies = taxonomies or {}
             # If target schema differs from on-disk, run migration to target
@@ -128,18 +200,6 @@ class Database:
             # Align schema to on-disk schema and recompute index specs
             self._schema = Schema(_schema_fields)
             self._compute_index_specs()
-        except IOCorruptionError:
-            # Initialize a new file
-            hdr = {
-                "format": "ejl1",
-                "table": os.path.splitext(os.path.basename(self.path))[0],
-                "created": now_iso(),
-                "defaults_always_materialized": True,
-            }
-            self._header = hdr
-            self._taxonomies = {}
-            self._fs.write_header_and_schema(hdr, self._schema._fields, self._taxonomies)
-            self._compute_index_specs()
 
         # Rebuild in-memory index from meta stream (streaming, no full list to reduce memory)
         self._index = InMemoryIndex()
@@ -149,44 +209,49 @@ class Database:
             total_bytes = 0
         scanned = 0
         last_pct = -1
-        for offset, line in self._fs.iter_meta_offsets():
-            scanned += 1
-            try:
-                meta = json.loads(line)
-            except Exception:
-                continue
-            if meta.get("_t") != "meta":
-                continue
-            rec_id = meta.get("id")
-            if not rec_id:
-                continue
-            op = meta.get("op")
-            ts_iso = meta.get("ts") or now_iso()
-            ts_ms = iso_to_epoch_ms(ts_iso)
-            offset_data = None
-            if op == "put":
-                # Data line immediately follows meta line
-                offset_data = offset + len(line.encode("utf-8"))
-            entry = MetaEntry(
-                id=rec_id,
-                offset_meta=offset,
-                offset_data=offset_data if op == "put" else None,
-                deleted=(op == "del"),
-                ts_ms=ts_ms,
-            )
-            self._index.add_meta(entry)
-            if total_bytes:
-                pct = min(99, int((offset * 100) / max(1, total_bytes)))
-                if last_pct == -1 or pct - last_pct >= 5 or pct == 99:
-                    self._progress.emit("open.scan_meta", pct, scanned=scanned, bytes_done=offset, bytes_total=total_bytes)
-                    last_pct = pct
+        # Hold a read lock for scanning (iter_meta_offsets also holds one defensively)
+        with self._process_lock("read"):
+            for offset, line in self._fs.iter_meta_offsets(
+                attempts=self.options.read_tail_retry_attempts,
+                sleep_ms=self.options.read_tail_sleep_ms,
+            ):
+                scanned += 1
+                try:
+                    meta = json.loads(line)
+                except Exception:
+                    continue
+                if meta.get("_t") != "meta":
+                    continue
+                rec_id = meta.get("id")
+                if not rec_id:
+                    continue
+                op = meta.get("op")
+                ts_iso = meta.get("ts") or now_iso()
+                ts_ms = iso_to_epoch_ms(ts_iso)
+                offset_data = None
+                if op == "put":
+                    # Data line immediately follows meta line
+                    offset_data = offset + len(line.encode("utf-8"))
+                entry = MetaEntry(
+                    id=rec_id,
+                    offset_meta=offset,
+                    offset_data=offset_data if op == "put" else None,
+                    deleted=(op == "del"),
+                    ts_ms=ts_ms,
+                )
+                self._index.add_meta(entry)
+                if total_bytes:
+                    pct = min(99, int((offset * 100) / max(1, total_bytes)))
+                    if last_pct == -1 or pct - last_pct >= 5 or pct == 99:
+                        self._progress.emit("open.scan_meta", pct, scanned=scanned, bytes_done=offset, bytes_total=total_bytes)
+                        last_pct = pct
         # Finish scan phase once
         self._progress.emit("open.scan_meta", 100, scanned=scanned)
 
         # Build secondary & reverse indexes from live records
-        # Build indexes once for this open cycle
         self._progress.emit("open.build_indexes", 0, total=len(self._index.meta))
-        self._build_indexes_on_open()
+        with self._process_lock("read"):
+            self._build_indexes_on_open()
         # NOTE: Performance notes (eng):
         # - Reopen and build indexes for 10k records ~0.47s on reference hardware (see tests).
         #   This phase streams meta to rebuild in-memory map and then optionally fast-extract scalars
@@ -203,10 +268,15 @@ class Database:
         return TDBRecord(self, rec)
 
     def get(self, rec_id: str, *, include_meta: bool = False) -> TDBRecord | None:
+        self._wait_for_maint()
         entry = self._index.meta.get(rec_id)
         if not entry or entry.deleted or entry.offset_data is None:
             return None
-        line = self._fs.read_line_at(entry.offset_data)
+        line = self._fs.read_line_at(
+            entry.offset_data,
+            attempts=self.options.read_tail_retry_attempts,
+            sleep_ms=self.options.read_tail_sleep_ms,
+        )
         try:
             obj = json.loads(line)
         except Exception:
@@ -214,7 +284,11 @@ class Database:
         # Optional integrity check against meta
         meta_obj = None
         try:
-            meta_line = self._fs.read_line_at(entry.offset_meta)
+            meta_line = self._fs.read_line_at(
+                entry.offset_meta,
+                attempts=self.options.read_tail_retry_attempts,
+                sleep_ms=self.options.read_tail_sleep_ms,
+            )
             meta_obj = json.loads(meta_line)
             # Compare against data without trailing newline
             data_str_no_nl = line[:-1] if line.endswith("\n") else line
@@ -247,6 +321,7 @@ class Database:
         order_by: List[Tuple[str, str]] | None = None,
         fields: List[str] | None = None,
     ) -> Iterable[TDBRecord]:
+        self._wait_for_maint()
         # Simple full-scan plan with basic predicate evaluation.
         # Supports:
         # - equality on scalars
@@ -441,10 +516,18 @@ class Database:
         for rec_id, entry in items_iter:
             if not entry or entry.deleted or entry.offset_data is None:
                 continue
-            line = self._fs.read_line_at(entry.offset_data)
+            line = self._fs.read_line_at(
+                entry.offset_data,
+                attempts=self.options.read_tail_retry_attempts,
+                sleep_ms=self.options.read_tail_sleep_ms,
+            )
             # Integrity check against meta; skip corrupt records
             try:
-                meta_line = self._fs.read_line_at(entry.offset_meta)
+                meta_line = self._fs.read_line_at(
+                    entry.offset_meta,
+                    attempts=self.options.read_tail_retry_attempts,
+                    sleep_ms=self.options.read_tail_sleep_ms,
+                )
                 meta_obj = json.loads(meta_line)
                 data_str_no_nl = line[:-1] if line.endswith("\n") else line
                 data_bytes = data_str_no_nl.encode("utf-8")
@@ -629,27 +712,32 @@ class Database:
         """
         Logical deletion: append meta(op:"del") for matched records and update index.
         """
+        # Wait if maintenance is active
+        self._wait_for_maint()
+
         n = 0
         self._progress.emit("delete.start", 0)
         for rec in self.find(query):
             if not rec._id:
                 continue
-            # Remove record from secondary/reverse indexes before marking deleted
-            self._index_remove_from_obj(rec._id, rec)
-            ts_iso = now_iso()
-            meta = {"id": rec._id, "op": "del", "ts": ts_iso}
-            off_meta, _ = self._fs.append_meta_data(meta, None)
-            entry = MetaEntry(
-                id=rec._id,
-                offset_meta=off_meta,
-                offset_data=None,
-                deleted=True,
-                ts_ms=iso_to_epoch_ms(ts_iso),
-            )
-            self._index.add_meta(entry)
-            n += 1
-            if n % 100 == 0:
-                self._progress.emit("delete.run", 0, deleted=n)
+            with self._write_lock:
+                with self._process_lock("write"):
+                    # Remove record from secondary/reverse indexes before marking deleted
+                    self._index_remove_from_obj(rec._id, rec)
+                    ts_iso = now_iso()
+                    meta = {"id": rec._id, "op": "del", "ts": ts_iso}
+                    off_meta, _ = self._fs.append_meta_data(meta, None)
+                    entry = MetaEntry(
+                        id=rec._id,
+                        offset_meta=off_meta,
+                        offset_data=None,
+                        deleted=True,
+                        ts_ms=iso_to_epoch_ms(ts_iso),
+                    )
+                    self._index.add_meta(entry)
+                    n += 1
+                    if n % 100 == 0:
+                        self._progress.emit("delete.run", 0, deleted=n)
         self._progress.emit("delete.done", 100, deleted=n)
         return n
 
@@ -795,7 +883,11 @@ class Database:
             for rid, ent in self._index.meta.items():
                 if ent.deleted or ent.offset_data is None:
                     continue
-                line = self._fs.read_line_at(ent.offset_data)
+                line = self._fs.read_line_at(
+                    ent.offset_data,
+                    attempts=self.options.read_tail_retry_attempts,
+                    sleep_ms=self.options.read_tail_sleep_ms,
+                )
                 # Secondary scalar indexes
                 for path, (tp, pat) in pat_map.items():
                     raw = extract_first(pat, line)
@@ -944,6 +1036,34 @@ class Database:
     def taxonomy(self, name: str) -> TaxonomyAPI:
         return TaxonomyAPI(self, name)
 
+    @contextmanager
+    def _process_lock(self, kind: str):
+        """
+        Process-level lock context manager: "read" | "write" | "maint".
+        """
+        ok = self._fs.acquire_lock(
+            "maint" if kind == "maint" else ("write" if kind == "write" else "read"),
+            attempts=self.options.process_lock_attempts,
+            sleep_ms=self.options.process_lock_sleep_ms,
+            allow_shared_read=self.options.allow_shared_read,
+        )
+        if not ok:
+            raise LockError(f"Failed to acquire {kind} lock after {self.options.process_lock_attempts} attempts")
+        try:
+            yield
+        finally:
+            self._fs.release_lock()
+
+    def _wait_for_maint(self) -> None:
+        """
+        Block reads/writes while maintenance is active in this process.
+        """
+        for _ in range(max(1, self.options.maintenance_attempts)):
+            if not self._maint_active:
+                return
+            time.sleep(max(0, self.options.maintenance_sleep_ms) / 1000.0)
+        raise LockError("Maintenance lock wait timed out")
+
     def _taxonomy_header_update(self, name: str, *, op: str, key: str, attrs: Dict[str, Any]) -> None:
         """
         Update taxonomy metadata in header only (no data migration). Rewrites header and rebuilds indexes.
@@ -953,45 +1073,53 @@ class Database:
             raise ValidationError("taxonomy name must be non-empty string")
         if not key or not isinstance(key, str):
             raise ValidationError("taxonomy key must be non-empty string")
-        taxo = self._taxonomies.setdefault(name, {"list": []})
-        items = taxo.get("list")
-        if not isinstance(items, list):
-            items = []
-            taxo["list"] = items
 
-        idx = None
-        for i, item in enumerate(items):
-            if isinstance(item, dict) and item.get("key") == key:
-                idx = i
-                break
+        # Block all operations in-process and hold an exclusive process lock
+        with self._maint_lock:
+            self._maint_active = True
+            try:
+                taxo = self._taxonomies.setdefault(name, {"list": []})
+                items = taxo.get("list")
+                if not isinstance(items, list):
+                    items = []
+                    taxo["list"] = items
 
-        if op == "upsert":
-            if idx is not None:
-                # merge attrs into existing
-                cur = dict(items[idx])
-                cur.update(attrs or {})
-                cur["key"] = key
-                items[idx] = cur
-            else:
-                new_item = {"key": key}
-                if attrs:
-                    new_item.update(attrs)
-                items.append(new_item)
-        elif op == "set_attrs":
-            if idx is None:
-                raise ValidationError("taxonomy key not found for set_attrs")
-            cur = dict(items[idx])
-            cur.update(attrs or {})
-            cur["key"] = key
-            items[idx] = cur
-        else:
-            raise ValidationError(f"unsupported taxonomy header op: {op!r}")
+                idx = None
+                for i, item in enumerate(items):
+                    if isinstance(item, dict) and item.get("key") == key:
+                        idx = i
+                        break
 
-        # Rewrite header safely (close handle to avoid appending to unlinked inode)
-        self._fs.close()
-        self._fs.rewrite_header(self._header, self._schema._fields, self._taxonomies)
-        # Reopen and rebuild indexes (offsets changed after header rewrite)
-        self._open("+")
+                if op == "upsert":
+                    if idx is not None:
+                        # merge attrs into existing
+                        cur = dict(items[idx])
+                        cur.update(attrs or {})
+                        cur["key"] = key
+                        items[idx] = cur
+                    else:
+                        new_item = {"key": key}
+                        if attrs:
+                            new_item.update(attrs)
+                        items.append(new_item)
+                elif op == "set_attrs":
+                    if idx is None:
+                        raise ValidationError("taxonomy key not found for set_attrs")
+                    cur = dict(items[idx])
+                    cur.update(attrs or {})
+                    cur["key"] = key
+                    items[idx] = cur
+                else:
+                    raise ValidationError(f"unsupported taxonomy header op: {op!r}")
+
+                # Rewrite header safely (close handle to avoid appending to unlinked inode)
+                with self._process_lock("maint"):
+                    self._fs.close()
+                    self._fs.rewrite_header(self._header, self._schema._fields, self._taxonomies)
+                # Reopen and rebuild indexes (offsets changed after header rewrite)
+                self._open("+")
+            finally:
+                self._maint_active = False
 
     def _taxonomy_migrate(self, name: str, **kwargs: Any) -> None:
         """
@@ -1005,110 +1133,121 @@ class Database:
         if action not in ("rename", "merge", "delete"):
             raise ValidationError("unsupported taxonomy migration action")
 
-        taxo = self._taxonomies.setdefault(name, {"list": []})
-        items = taxo.get("list") or []
-        if not isinstance(items, list):
-            items = []
-        items_by_key = {item.get("key"): dict(item) for item in items if isinstance(item, dict) and "key" in item}
-
-        mapping: Dict[str, Optional[str]] = {}
-
-        if action == "rename":
-            old_key = kwargs.get("old_key")
-            new_key = kwargs.get("new_key")
-            collision = kwargs.get("collision", "merge")
-            if not old_key or not new_key:
-                raise ValidationError("rename requires old_key and new_key")
-            mapping[old_key] = new_key
-            if collision != "merge" and new_key in items_by_key and old_key in items_by_key:
-                raise ValidationError("rename collision not supported other than 'merge'")
-            if old_key in items_by_key:
-                src = items_by_key.pop(old_key)
-                if new_key not in items_by_key:
-                    src["key"] = new_key
-                    items_by_key[new_key] = src
-
-        elif action == "merge":
-            source_keys = kwargs.get("source_keys") or []
-            target_key = kwargs.get("target_key")
-            if not isinstance(source_keys, list) or not target_key:
-                raise ValidationError("merge requires source_keys list and target_key")
-            for sk in source_keys:
-                if sk == target_key:
-                    continue
-                mapping[sk] = target_key
-            if target_key not in items_by_key:
-                items_by_key[target_key] = {"key": target_key}
-            for sk in source_keys:
-                items_by_key.pop(sk, None)
-
-        elif action == "delete":
-            key = kwargs.get("key")
-            strategy = kwargs.get("strategy", "detach")
-            if not key:
-                raise ValidationError("delete requires key")
-            if strategy != "detach":
-                raise ValidationError("only 'detach' delete strategy is supported")
-            mapping[key] = None
-            items_by_key.pop(key, None)
-
-        # Update in-memory taxonomies and write migrated file
-        new_items = list(items_by_key.values())
-        self._taxonomies[name] = {"list": new_items}
-
-        # Determine schema paths referencing this taxonomy
-        list_paths = [p for (p, t) in self._rev_list_paths if t == name]
-        scalar_paths = [p for (p, t) in self._rev_single_paths if t == name]
-
-        # Close handle, then rewrite file
-        self._fs.close()
-
-        tmp_path = f"{self.path}.migrate.tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
-            # Write header with updated taxonomies
-            header_lines = [
-                {"_t": "header", **self._header},
-                {"_t": "schema", "fields": self._schema._fields},
-                {"_t": "taxonomies", "items": self._taxonomies},
-                {"_t": "begin"},
-            ]
-            for obj in header_lines:
-                dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-            # Copy and transform live records by ts order
-            live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
-            live_entries.sort(key=lambda e: e.ts_ms)
-            total = len(live_entries)
-            for i, e in enumerate(live_entries, 1):
-                line = self._fs.read_line_at(e.offset_data)
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                self._transform_taxonomy_in_obj(obj, list_paths=list_paths, scalar_paths=scalar_paths, mapping=mapping)
-                data_str = canonical_json(obj)
-                data_bytes = data_str.encode("utf-8")
-                ts_iso = now_iso()
-                meta_obj = {
-                    "_t": "meta",
-                    "id": e.id,
-                    "op": "put",
-                    "ts": ts_iso,
-                    "len_data": len(data_bytes),
-                    "sha256_data": sha256_hex(data_bytes),
-                }
-                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-                dst.write(data_str + "\n")
-                self._progress.emit("taxonomy.migrate", int(i * 100 / max(1, total)), key=name, action=action)
-
-            dst.flush()
+        # Block all operations in-process and hold an exclusive process lock
+        with self._maint_lock:
+            self._maint_active = True
             try:
-                os.fsync(dst.fileno())
-            except Exception:
-                pass
+                taxo = self._taxonomies.setdefault(name, {"list": []})
+                items = taxo.get("list") or []
+                if not isinstance(items, list):
+                    items = []
+                items_by_key = {item.get("key"): dict(item) for item in items if isinstance(item, dict) and "key" in item}
 
-        self._fs.replace_file(tmp_path)
-        self._open("+")
+                mapping: Dict[str, Optional[str]] = {}
+
+                if action == "rename":
+                    old_key = kwargs.get("old_key")
+                    new_key = kwargs.get("new_key")
+                    collision = kwargs.get("collision", "merge")
+                    if not old_key or not new_key:
+                        raise ValidationError("rename requires old_key and new_key")
+                    mapping[old_key] = new_key
+                    if collision != "merge" and new_key in items_by_key and old_key in items_by_key:
+                        raise ValidationError("rename collision not supported other than 'merge'")
+                    if old_key in items_by_key:
+                        src = items_by_key.pop(old_key)
+                        if new_key not in items_by_key:
+                            src["key"] = new_key
+                            items_by_key[new_key] = src
+
+                elif action == "merge":
+                    source_keys = kwargs.get("source_keys") or []
+                    target_key = kwargs.get("target_key")
+                    if not isinstance(source_keys, list) or not target_key:
+                        raise ValidationError("merge requires source_keys list and target_key")
+                    for sk in source_keys:
+                        if sk == target_key:
+                            continue
+                        mapping[sk] = target_key
+                    if target_key not in items_by_key:
+                        items_by_key[target_key] = {"key": target_key}
+                    for sk in source_keys:
+                        items_by_key.pop(sk, None)
+
+                elif action == "delete":
+                    key = kwargs.get("key")
+                    strategy = kwargs.get("strategy", "detach")
+                    if not key:
+                        raise ValidationError("delete requires key")
+                    if strategy != "detach":
+                        raise ValidationError("only 'detach' delete strategy is supported")
+                    mapping[key] = None
+                    items_by_key.pop(key, None)
+
+                # Update in-memory taxonomies before migration
+                new_items = list(items_by_key.values())
+                self._taxonomies[name] = {"list": new_items}
+
+                # Determine schema paths referencing this taxonomy
+                list_paths = [p for (p, t) in self._rev_list_paths if t == name]
+                scalar_paths = [p for (p, t) in self._rev_single_paths if t == name]
+
+                # Close handle, then rewrite file under exclusive process lock
+                with self._process_lock("maint"):
+                    self._fs.close()
+
+                    tmp_path = f"{self.path}.migrate.tmp"
+                    with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+                        # Write header with updated taxonomies
+                        header_lines = [
+                            {"_t": "header", **self._header},
+                            {"_t": "schema", "fields": self._schema._fields},
+                            {"_t": "taxonomies", "items": self._taxonomies},
+                            {"_t": "begin"},
+                        ]
+                        for obj in header_lines:
+                            dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+                        # Copy and transform live records by ts order
+                        live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
+                        live_entries.sort(key=lambda e: e.ts_ms)
+                        total = len(live_entries)
+                        for i, e in enumerate(live_entries, 1):
+                            line = self._fs.read_line_at(
+                                e.offset_data,
+                                attempts=self.options.read_tail_retry_attempts,
+                                sleep_ms=self.options.read_tail_sleep_ms,
+                            )
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            self._transform_taxonomy_in_obj(obj, list_paths=list_paths, scalar_paths=scalar_paths, mapping=mapping)
+                            data_str = canonical_json(obj)
+                            data_bytes = data_str.encode("utf-8")
+                            ts_iso = now_iso()
+                            meta_obj = {
+                                "_t": "meta",
+                                "id": e.id,
+                                "op": "put",
+                                "ts": ts_iso,
+                                "len_data": len(data_bytes),
+                                "sha256_data": sha256_hex(data_bytes),
+                            }
+                            dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                            dst.write(data_str + "\n")
+                            self._progress.emit("taxonomy.migrate", int(i * 100 / max(1, total)), key=name, action=action)
+
+                        dst.flush()
+                        try:
+                            os.fsync(dst.fileno())
+                        except Exception:
+                            pass
+
+                    self._fs.replace_file(tmp_path)
+                self._open("+")
+            finally:
+                self._maint_active = False
 
     def _migrate_schema_to(self, new_fields: Dict[str, Any], old_fields: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -1132,82 +1271,96 @@ class Database:
                 if new_t != old_t:
                     raise SchemaError(f"schema type change for field '{path}': {old_t} -> {new_t} is not supported")
 
-        # Close handle to avoid writing to unlinked inode during replace
-        self._fs.close()
-
-        tmp_path = f"{self.path}.schemamigrate.tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
-            # Write header with updated schema
-            header_lines = [
-                {"_t": "header", **self._header},
-                {"_t": "schema", "fields": new_fields},
-                {"_t": "taxonomies", "items": self._taxonomies},
-                {"_t": "begin"},
-            ]
-            for obj in header_lines:
-                dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-            # Build live entries by streaming meta (self._index is not built yet on fresh open)
-            live_map: Dict[str, MetaEntry] = {}
-            for offset, mline in self._fs.iter_meta_offsets():
-                try:
-                    m = json.loads(mline)
-                except Exception:
-                    continue
-                if m.get("_t") != "meta":
-                    continue
-                rid = m.get("id")
-                if not isinstance(rid, str) or not rid:
-                    continue
-                op = m.get("op")
-                ts_iso = m.get("ts") or now_iso()
-                ts_ms = iso_to_epoch_ms(ts_iso)
-                off_data = offset + len(mline.encode("utf-8")) if op == "put" else None
-                live_map[rid] = MetaEntry(
-                    id=rid, offset_meta=offset, offset_data=off_data, deleted=(op == "del"), ts_ms=ts_ms
-                )
-
-            live_entries = [e for e in live_map.values() if (not e.deleted) and (e.offset_data is not None)]
-            live_entries.sort(key=lambda e: e.ts_ms)
-            total = len(live_entries)
-            for i, e in enumerate(live_entries, 1):
-                line = self._fs.read_line_at(e.offset_data)
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                # Apply defaults of new schema and validate
-                sch_new.apply_defaults(obj)
-                sch_new.validate(obj)
-
-                data_str = canonical_json(obj)
-                data_bytes = data_str.encode("utf-8")
-                ts_iso = now_iso()
-                meta_obj = {
-                    "_t": "meta",
-                    "id": e.id,
-                    "op": "put",
-                    "ts": ts_iso,
-                    "len_data": len(data_bytes),
-                    "sha256_data": sha256_hex(data_bytes),
-                }
-                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-                dst.write(data_str + "\n")
-                self._progress.emit("schema.migrate", int(i * 100 / max(1, total)), migrated=i, total=total)
-
-            dst.flush()
+        # Block all operations in-process and hold an exclusive process lock
+        with self._maint_lock:
+            self._maint_active = True
             try:
-                os.fsync(dst.fileno())
-            except Exception:
-                pass
+                with self._process_lock("maint"):
+                    # Close handle to avoid writing to unlinked inode during replace
+                    self._fs.close()
 
-        # Replace file and reopen (will rebuild indexes against the new schema)
-        self._fs.replace_file(tmp_path)
-        # Update in-memory schema to the new one for subsequent operations
-        self._schema = Schema(new_fields)
-        self._compute_index_specs()
-        self._open("+")
-        self._progress.emit("schema.migrate", 100, msg="Schema migration complete")
+                    tmp_path = f"{self.path}.schemamigrate.tmp"
+                    with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+                        # Write header with updated schema
+                        header_lines = [
+                            {"_t": "header", **self._header},
+                            {"_t": "schema", "fields": new_fields},
+                            {"_t": "taxonomies", "items": self._taxonomies},
+                            {"_t": "begin"},
+                        ]
+                        for obj in header_lines:
+                            dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+                        # Build live entries by streaming meta (self._index is not built yet on fresh open)
+                        live_map: Dict[str, MetaEntry] = {}
+                        for offset, mline in self._fs.iter_meta_offsets(
+                            attempts=self.options.read_tail_retry_attempts,
+                            sleep_ms=self.options.read_tail_sleep_ms,
+                        ):
+                            try:
+                                m = json.loads(mline)
+                            except Exception:
+                                continue
+                            if m.get("_t") != "meta":
+                                continue
+                            rid = m.get("id")
+                            if not isinstance(rid, str) or not rid:
+                                continue
+                            op = m.get("op")
+                            ts_iso = m.get("ts") or now_iso()
+                            ts_ms = iso_to_epoch_ms(ts_iso)
+                            off_data = offset + len(mline.encode("utf-8")) if op == "put" else None
+                            live_map[rid] = MetaEntry(
+                                id=rid, offset_meta=offset, offset_data=off_data, deleted=(op == "del"), ts_ms=ts_ms
+                            )
+
+                        live_entries = [e for e in live_map.values() if (not e.deleted) and (e.offset_data is not None)]
+                        live_entries.sort(key=lambda e: e.ts_ms)
+                        total = len(live_entries)
+                        for i, e in enumerate(live_entries, 1):
+                            line = self._fs.read_line_at(
+                                e.offset_data,
+                                attempts=self.options.read_tail_retry_attempts,
+                                sleep_ms=self.options.read_tail_sleep_ms,
+                            )
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            # Apply defaults of new schema and validate
+                            sch_new.apply_defaults(obj)
+                            sch_new.validate(obj)
+
+                            data_str = canonical_json(obj)
+                            data_bytes = data_str.encode("utf-8")
+                            ts_iso = now_iso()
+                            meta_obj = {
+                                "_t": "meta",
+                                "id": e.id,
+                                "op": "put",
+                                "ts": ts_iso,
+                                "len_data": len(data_bytes),
+                                "sha256_data": sha256_hex(data_bytes),
+                            }
+                            dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                            dst.write(data_str + "\n")
+                            self._progress.emit("schema.migrate", int(i * 100 / max(1, total)), migrated=i, total=total)
+
+                        dst.flush()
+                        try:
+                            os.fsync(dst.fileno())
+                        except Exception:
+                            pass
+
+                    # Replace file and reopen (will rebuild indexes against the new schema)
+                    self._fs.replace_file(tmp_path)
+                # Update in-memory schema to the new one for subsequent operations
+                self._schema = Schema(new_fields)
+                self._compute_index_specs()
+                self._open("+")
+                self._progress.emit("schema.migrate", 100, msg="Schema migration complete")
+            finally:
+                self._maint_active = False
 
     def compact_now(self) -> None:
         """
@@ -1216,7 +1369,10 @@ class Database:
         """
         # Compute garbage ratio as (total_meta - live_count) / total_meta
         total_meta = 0
-        for _ in self._fs.iter_meta_offsets():
+        for _ in self._fs.iter_meta_offsets(
+            attempts=self.options.read_tail_retry_attempts,
+            sleep_ms=self.options.read_tail_sleep_ms,
+        ):
             total_meta += 1
         live_entries = [e for e in self._index.meta.values() if (not e.deleted) and (e.offset_data is not None)]
         live_count = len(live_entries)
@@ -1228,62 +1384,69 @@ class Database:
 
         self._progress.emit("compact.start", 0, msg="Starting compaction", total_meta=total_meta, live=live_count)
 
-        # Close file handle to ensure stable rename on replace
-        self._fs.close()
-
-        tmp_path = f"{self.path}.compact.tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
-            # Write header
-            lines = [
-                {"_t": "header", **self._header},
-                {"_t": "schema", "fields": self._schema._fields},
-                {"_t": "taxonomies", "items": self._taxonomies},
-                {"_t": "begin"},
-            ]
-            for obj in lines:
-                s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-                dst.write(s + "\n")
-
-            # Copy live records in file order to minimize seeks. No JSON parse.
-            live_entries_sorted = sorted(live_entries, key=lambda e: (e.offset_data or 0))
-            total = len(live_entries_sorted)
-            with open(self.path, "rb") as src:
-                for i, e in enumerate(live_entries_sorted, 1):
-                    if e.offset_data is None:
-                        continue
-                    src.seek(e.offset_data)
-                    line_bytes = src.readline()
-                    try:
-                        data_str = line_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        # Replace invalid bytes to keep compaction robust
-                        data_str = line_bytes.decode("utf-8", errors="replace")
-                    # Remove trailing newline for len/hash calculation
-                    data_str_no_nl = data_str[:-1] if data_str.endswith("\n") else data_str
-                    data_bytes = data_str_no_nl.encode("utf-8")
-                    ts_iso = now_iso()
-                    meta_obj = {
-                        "_t": "meta",
-                        "id": e.id,
-                        "op": "put",
-                        "ts": ts_iso,
-                        "len_data": len(data_bytes),
-                        "sha256_data": sha256_hex(data_bytes),
-                    }
-                    dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-                    dst.write(data_str_no_nl + "\n")
-                    self._progress.emit("compact.copy", int(i * 100 / max(1, total)), copied=i, total=total)
-
-            dst.flush()
+        # Block all operations in-process and hold an exclusive process lock
+        with self._maint_lock:
+            self._maint_active = True
             try:
-                os.fsync(dst.fileno())
-            except Exception:
-                pass
+                with self._process_lock("maint"):
+                    # Close file handle to ensure stable rename on replace
+                    self._fs.close()
 
-        # Atomically replace and reopen
-        self._fs.replace_file(tmp_path)
-        self._open("+")
-        self._progress.emit("compact.done", 100, msg="Compaction complete", live=live_count)
+                    tmp_path = f"{self.path}.compact.tmp"
+                    with open(tmp_path, "w", encoding="utf-8", newline="\n") as dst:
+                        # Write header
+                        lines = [
+                            {"_t": "header", **self._header},
+                            {"_t": "schema", "fields": self._schema._fields},
+                            {"_t": "taxonomies", "items": self._taxonomies},
+                            {"_t": "begin"},
+                        ]
+                        for obj in lines:
+                            s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                            dst.write(s + "\n")
+
+                        # Copy live records in file order to minimize seeks. No JSON parse.
+                        live_entries_sorted = sorted(live_entries, key=lambda e: (e.offset_data or 0))
+                        total = len(live_entries_sorted)
+                        with open(self.path, "rb") as src:
+                            for i, e in enumerate(live_entries_sorted, 1):
+                                if e.offset_data is None:
+                                    continue
+                                src.seek(e.offset_data)
+                                line_bytes = src.readline()
+                                try:
+                                    data_str = line_bytes.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    # Replace invalid bytes to keep compaction robust
+                                    data_str = line_bytes.decode("utf-8", errors="replace")
+                                # Remove trailing newline for len/hash calculation
+                                data_str_no_nl = data_str[:-1] if data_str.endswith("\n") else data_str
+                                data_bytes = data_str_no_nl.encode("utf-8")
+                                ts_iso = now_iso()
+                                meta_obj = {
+                                    "_t": "meta",
+                                    "id": e.id,
+                                    "op": "put",
+                                    "ts": ts_iso,
+                                    "len_data": len(data_bytes),
+                                    "sha256_data": sha256_hex(data_bytes),
+                                }
+                                dst.write(json.dumps(meta_obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                                dst.write(data_str_no_nl + "\n")
+                                self._progress.emit("compact.copy", int(i * 100 / max(1, total)), copied=i, total=total)
+
+                        dst.flush()
+                        try:
+                            os.fsync(dst.fileno())
+                        except Exception:
+                            pass
+
+                    # Atomically replace and reopen
+                    self._fs.replace_file(tmp_path)
+                self._open("+")
+                self._progress.emit("compact.done", 100, msg="Compaction complete", live=live_count)
+            finally:
+                self._maint_active = False
 
     def backup_now(self, kind: str = "rolling") -> None:
         """
@@ -1302,72 +1465,84 @@ class Database:
         base = os.path.basename(self.path)
 
         if kind == "rolling":
-            self._progress.emit("backup.rolling", 0, msg="Rolling backup")
-            # Rotate .bak.N files
-            last_path = os.path.join(root_dir, f"{base}.bak.{keep}")
-            if os.path.exists(last_path):
+            with self._maint_lock:
+                self._maint_active = True
                 try:
-                    os.remove(last_path)
-                except Exception:
-                    pass
-            for i in range(keep, 1, -1):
-                src = os.path.join(root_dir, f"{base}.bak.{i-1}")
-                dst = os.path.join(root_dir, f"{base}.bak.{i}")
-                if os.path.exists(src):
-                    try:
-                        os.replace(src, dst)
-                    except Exception:
-                        try:
-                            shutil.copy2(src, dst)
-                            os.remove(src)
-                        except Exception:
-                            pass
-            dest1 = os.path.join(root_dir, f"{base}.bak.1")
-            with open(self.path, "rb") as src_f, open(dest1, "wb") as dst_f:
-                shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
-                dst_f.flush()
-                try:
-                    os.fsync(dst_f.fileno())
-                except Exception:
-                    pass
-            self._progress.emit("backup.rolling", 100, msg="Rolling backup complete", path=dest1)
+                    with self._process_lock("maint"):
+                        self._progress.emit("backup.rolling", 0, msg="Rolling backup")
+                        # Rotate .bak.N files
+                        last_path = os.path.join(root_dir, f"{base}.bak.{keep}")
+                        if os.path.exists(last_path):
+                            try:
+                                os.remove(last_path)
+                            except Exception:
+                                pass
+                        for i in range(keep, 1, -1):
+                            src = os.path.join(root_dir, f"{base}.bak.{i-1}")
+                            dst = os.path.join(root_dir, f"{base}.bak.{i}")
+                            if os.path.exists(src):
+                                try:
+                                    os.replace(src, dst)
+                                except Exception:
+                                    try:
+                                        shutil.copy2(src, dst)
+                                        os.remove(src)
+                                    except Exception:
+                                        pass
+                        dest1 = os.path.join(root_dir, f"{base}.bak.1")
+                        with open(self.path, "rb") as src_f, open(dest1, "wb") as dst_f:
+                            shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
+                            dst_f.flush()
+                            try:
+                                os.fsync(dst_f.fileno())
+                            except Exception:
+                                pass
+                        self._progress.emit("backup.rolling", 100, msg="Rolling backup complete", path=dest1)
+                finally:
+                    self._maint_active = False
 
         elif kind == "daily":
-            self._progress.emit("backup.daily", 0, msg="Daily backup")
-            daily_dir = os.path.join(root_dir, daily_dirname)
-            os.makedirs(daily_dir, exist_ok=True)
-            date_str = now_iso().split("T", 1)[0]
-            dest = os.path.join(daily_dir, f"{base}.{date_str}.jsonl.gz")
-            if os.path.exists(dest):
-                self._progress.emit("backup.daily", 100, msg="Daily backup exists", path=dest)
-            else:
-                with open(self.path, "rb") as src_f, gzip.open(dest, "wb") as gz:
-                    shutil.copyfileobj(src_f, gz, length=1024 * 1024)
-                    try:
-                        gz.flush()
-                    except Exception:
-                        pass
-                self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
-            # Retention: keep only last N daily backups
-            daily_keep = int(backup_conf.get("daily_keep", 7))
-            try:
-                all_files = sorted(os.listdir(daily_dir))
-                # match files of this DB only
-                pat = re.compile(re.escape(base) + r"\.\d{4}-\d{2}-\d{2}\.jsonl\.gz\Z")
-                own_files = [f for f in all_files if pat.match(f)]
-                if len(own_files) > daily_keep:
-                    to_delete = own_files[:-daily_keep]
-                    for fn in to_delete:
+            with self._maint_lock:
+                self._maint_active = True
+                try:
+                    with self._process_lock("maint"):
+                        self._progress.emit("backup.daily", 0, msg="Daily backup")
+                        daily_dir = os.path.join(root_dir, daily_dirname)
+                        os.makedirs(daily_dir, exist_ok=True)
+                        date_str = now_iso().split("T", 1)[0]
+                        dest = os.path.join(daily_dir, f"{base}.{date_str}.jsonl.gz")
+                        if os.path.exists(dest):
+                            self._progress.emit("backup.daily", 100, msg="Daily backup exists", path=dest)
+                        else:
+                            with open(self.path, "rb") as src_f, gzip.open(dest, "wb") as gz:
+                                shutil.copyfileobj(src_f, gz, length=1024 * 1024)
+                                try:
+                                    gz.flush()
+                                except Exception:
+                                    pass
+                            self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
+                        # Retention: keep only last N daily backups
+                        daily_keep = int(backup_conf.get("daily_keep", 7))
                         try:
-                            os.remove(os.path.join(daily_dir, fn))
+                            all_files = sorted(os.listdir(daily_dir))
+                            # match files of this DB only
+                            pat = re.compile(re.escape(base) + r"\.\d{4}-\d{2}-\d{2}\.jsonl\.gz\Z")
+                            own_files = [f for f in all_files if pat.match(f)]
+                            if len(own_files) > daily_keep:
+                                to_delete = own_files[:-daily_keep]
+                                for fn in to_delete:
+                                    try:
+                                        os.remove(os.path.join(daily_dir, fn))
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
-            except Exception:
-                pass
+                finally:
+                    self._maint_active = False
         else:
             raise ValidationError(f"Unknown backup kind: {kind!r}")
 
-        # Reacquire exclusive lock without full reopen
+        # Reacquire file handle (no locking) for subsequent operations
         self._fs.open_exclusive("+")
 
     def put_blob(self, stream_or_bytes, *, mime: str, filename: str | None = None) -> Dict[str, Any]:
@@ -1394,6 +1569,7 @@ class Database:
         """
         Garbage-collect orphaned blobs based on references in live records.
         """
+        self._wait_for_maint()
         # Collect referenced hashes from all live records
         def collect(obj, out: Set[str]) -> None:
             if isinstance(obj, dict):
@@ -1410,7 +1586,11 @@ class Database:
             if e.deleted or e.offset_data is None:
                 continue
             try:
-                line = self._fs.read_line_at(e.offset_data)
+                line = self._fs.read_line_at(
+                    e.offset_data,
+                    attempts=self.options.read_tail_retry_attempts,
+                    sleep_ms=self.options.read_tail_sleep_ms,
+                )
                 obj = json.loads(line)
             except Exception:
                 continue
@@ -1499,83 +1679,92 @@ class Database:
         return
 
     def _record_save(self, rec: TDBRecord, *, force: bool) -> None:
-        # Assign/align id and createdAt on new records
-        if rec._id is None:
-            # If user pre-filled "id" field, respect it; otherwise generate new ULID
-            pre_id = rec.get("id")
-            if isinstance(pre_id, str) and pre_id:
-                rec._id = pre_id
-            else:
-                rec._id = new_ulid()
-                rec["id"] = rec._id
-            if "createdAt" not in rec:
-                rec["createdAt"] = now_iso()
-        else:
-            # Ensure the data field "id" matches internal _id
-            if rec.get("id") != rec._id:
-                rec["id"] = rec._id
+        # Wait if maintenance is active
+        self._wait_for_maint()
 
-        if not force and not rec.dirty:
-            return
+        with self._write_lock:
+            with self._process_lock("write"):
+                # Assign/align id and createdAt on new records
+                if rec._id is None:
+                    # If user pre-filled "id" field, respect it; otherwise generate new ULID
+                    pre_id = rec.get("id")
+                    if isinstance(pre_id, str) and pre_id:
+                        rec._id = pre_id
+                    else:
+                        rec._id = new_ulid()
+                        rec["id"] = rec._id
+                    if "createdAt" not in rec:
+                        rec["createdAt"] = now_iso()
+                else:
+                    # Ensure the data field "id" matches internal _id
+                    if rec.get("id") != rec._id:
+                        rec["id"] = rec._id
 
-        # Optimistic concurrency: ensure we save over the latest version
-        if rec._id is not None and rec._meta_offset is not None:
-            cur = self._index.meta.get(rec._id)
-            if cur and cur.offset_meta != rec._meta_offset:
-                raise ConflictError("record was modified by another operation")
+                if not force and not rec.dirty:
+                    return
 
-        # Duplicate id guard on first insert
-        existing = self._index.meta.get(rec._id) if rec._id is not None else None
-        if rec._meta_offset is None and existing and not existing.deleted:
-            raise DuplicateIdError(f"record with id '{rec._id}' already exists")
+                # Optimistic concurrency: ensure we save over the latest version
+                if rec._id is not None and rec._meta_offset is not None:
+                    cur = self._index.meta.get(rec._id)
+                    if cur and cur.offset_meta != rec._meta_offset:
+                        raise ConflictError("record was modified by another operation")
 
-        # Full validation
-        self._schema.validate(rec)
-        # Enforce taxonomy strictness (if enabled in schema)
-        self._validate_taxonomies_strict(rec)
+                # Duplicate id guard on first insert
+                existing = self._index.meta.get(rec._id) if rec._id is not None else None
+                if rec._meta_offset is None and existing and not existing.deleted:
+                    raise DuplicateIdError(f"record with id '{rec._id}' already exists")
 
-        # Remove old index entries if any
-        old_entry = self._index.meta.get(rec._id) if rec._id else None
-        if old_entry and not old_entry.deleted and old_entry.offset_data is not None:
-            try:
-                old_line = self._fs.read_line_at(old_entry.offset_data)
-                old_obj = json.loads(old_line)
-                self._index_remove_from_obj(rec._id, old_obj)
-            except Exception:
-                pass
+                # Full validation
+                self._schema.validate(rec)
+                # Enforce taxonomy strictness (if enabled in schema)
+                self._validate_taxonomies_strict(rec)
 
-        # Serialize and compute meta
-        data_str = canonical_json(dict(rec))
-        data_bytes = data_str.encode("utf-8")
-        ts_iso = now_iso()
-        meta = {
-            "id": rec._id,
-            "op": "put",
-            "ts": ts_iso,
-            "len_data": len(data_bytes),
-            "sha256_data": sha256_hex(data_bytes),
-        }
+                # Remove old index entries if any
+                old_entry = self._index.meta.get(rec._id) if rec._id else None
+                if old_entry and not old_entry.deleted and old_entry.offset_data is not None:
+                    try:
+                        old_line = self._fs.read_line_at(
+                            old_entry.offset_data,
+                            attempts=self.options.read_tail_retry_attempts,
+                            sleep_ms=self.options.read_tail_sleep_ms,
+                        )
+                        old_obj = json.loads(old_line)
+                        self._index_remove_from_obj(rec._id, old_obj)
+                    except Exception:
+                        pass
 
-        # Append and get offsets
-        off_meta, off_data = self._fs.append_meta_data(meta, data_str)
+                # Serialize and compute meta
+                data_str = canonical_json(dict(rec))
+                data_bytes = data_str.encode("utf-8")
+                ts_iso = now_iso()
+                meta = {
+                    "id": rec._id,
+                    "op": "put",
+                    "ts": ts_iso,
+                    "len_data": len(data_bytes),
+                    "sha256_data": sha256_hex(data_bytes),
+                }
 
-        # Update index
-        entry = MetaEntry(
-            id=rec._id,
-            offset_meta=off_meta,
-            offset_data=off_data,
-            deleted=False,
-            ts_ms=iso_to_epoch_ms(ts_iso),
-        )
-        self._index.add_meta(entry)
+                # Append and get offsets
+                off_meta, off_data = self._fs.append_meta_data(meta, data_str)
 
-        # Update secondary/reverse indexes for new content
-        self._index_add_from_obj(rec._id, rec)
+                # Update index
+                entry = MetaEntry(
+                    id=rec._id,
+                    offset_meta=off_meta,
+                    offset_data=off_data,
+                    deleted=False,
+                    ts_ms=iso_to_epoch_ms(ts_iso),
+                )
+                self._index.add_meta(entry)
 
-        # Sync state
-        rec._meta_offset = off_meta
-        rec._orig_hash = rec._hash_data()
-        rec._dirty_fields.clear()
+                # Update secondary/reverse indexes for new content
+                self._index_add_from_obj(rec._id, rec)
+
+                # Sync state
+                rec._meta_offset = off_meta
+                rec._orig_hash = rec._hash_data()
+                rec._dirty_fields.clear()
 
     @staticmethod
     def _deep_update(rec: Dict[str, Any], patch: Dict[str, Any]) -> None:
