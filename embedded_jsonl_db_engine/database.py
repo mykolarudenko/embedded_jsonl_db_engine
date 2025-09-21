@@ -36,6 +36,10 @@ class Options:
         maintenance_attempts: int = 40,
         maintenance_sleep_ms: int = 50,
         allow_shared_read: bool = True,
+        backup_root_dir: str = "embedded_jsonl_db_backup",
+        backup_rolling_keep: int = 3,
+        backup_daily_dir: str = "daily",
+        backup_daily_keep: int = 7,
     ) -> None:
         self.process_lock_attempts = int(process_lock_attempts)
         self.process_lock_sleep_ms = int(process_lock_sleep_ms)
@@ -44,6 +48,10 @@ class Options:
         self.maintenance_attempts = int(maintenance_attempts)
         self.maintenance_sleep_ms = int(maintenance_sleep_ms)
         self.allow_shared_read = bool(allow_shared_read)
+        self.backup_root_dir = str(backup_root_dir)
+        self.backup_rolling_keep = int(backup_rolling_keep)
+        self.backup_daily_dir = str(backup_daily_dir)
+        self.backup_daily_keep = int(backup_daily_keep)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "Options":
@@ -61,6 +69,10 @@ class Options:
             maintenance_attempts=int(d.get("maintenance_attempts", 40)),
             maintenance_sleep_ms=int(d.get("maintenance_sleep_ms", 50)),
             allow_shared_read=bool(d.get("allow_shared_read", True)),
+            backup_root_dir=str(d.get("backup_root_dir", "embedded_jsonl_db_backup")),
+            backup_rolling_keep=int(d.get("backup_rolling_keep", 3)),
+            backup_daily_dir=str(d.get("backup_daily_dir", "daily")),
+            backup_daily_keep=int(d.get("backup_daily_keep", 7)),
         )
 
 class TDBRecord(dict):
@@ -1452,11 +1464,11 @@ class Database:
         """
         Create backups: rolling (.bak.N) or daily gz snapshot.
         """
-        backup_conf = self._maintenance.get("backup", {}) if isinstance(self._maintenance, dict) else {}
-        keep = int(backup_conf.get("rolling_keep", 3))
-        daily_dirname = str(backup_conf.get("daily_dir", "daily"))
+        keep = int(self.options.backup_rolling_keep)
+        daily_dirname = str(self.options.backup_daily_dir)
 
-        root_dir = os.path.join(os.path.dirname(os.path.abspath(self.path)), "embedded_jsonl_db_backup")
+        root_dir_name = str(self.options.backup_root_dir)
+        root_dir = os.path.join(os.path.dirname(os.path.abspath(self.path)), root_dir_name)
         os.makedirs(root_dir, exist_ok=True)
 
         # Ensure data is flushed by closing handle temporarily
@@ -1522,7 +1534,7 @@ class Database:
                                     pass
                             self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
                         # Retention: keep only last N daily backups
-                        daily_keep = int(backup_conf.get("daily_keep", 7))
+                        daily_keep = int(self.options.backup_daily_keep)
                         try:
                             all_files = sorted(os.listdir(daily_dir))
                             # match files of this DB only

@@ -4,6 +4,7 @@ import os
 import json
 from typing import Dict, Iterator, Tuple
 import time
+import threading
 from .errors import LockError, IOCorruptionError
 
 HEADER_T = "header"
@@ -25,7 +26,7 @@ class FileStorage:
         self._lock_fh: io.TextIOWrapper | None = None
         self._plock_impl: str | None = None
         self._lock_mode: str | None = None  # "read" | "write" | "maint"
-        self._lock_depth: int = 0
+        self._lock_depths: Dict[int, int] = {}
 
     def open_exclusive(self, mode: str = "+") -> None:
         """
@@ -67,9 +68,12 @@ class FileStorage:
         Returns True on success, False if attempts exhausted.
         Nested acquisitions are reference-counted.
         """
-        if self._lock_depth > 0:
-            # Nested acquisition within the same process/thread
-            self._lock_depth += 1
+        tid = threading.get_ident()
+        total_depth = sum(self._lock_depths.values())
+        if total_depth > 0:
+            # Nested acquisition within the same process (another or same thread).
+            # Track per-thread depth to keep OS lock until the last thread exits.
+            self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
             return True
 
         lock_path = self.path + ".lock"
@@ -94,7 +98,8 @@ class FileStorage:
                         flags = fcntl.LOCK_SH | fcntl.LOCK_NB
                     fcntl.flock(self._lock_fh.fileno(), flags)
                     self._plock_impl = "fcntl"
-                    self._lock_depth = 1
+                    tid = threading.get_ident()
+                    self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                     return True
                 except Exception as e_fcntl:
                     last_err = e_fcntl
@@ -104,7 +109,8 @@ class FileStorage:
                         # msvcrt has no shared variant; lock 1 byte exclusively
                         msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
                         self._plock_impl = "msvcrt"
-                        self._lock_depth = 1
+                        tid = threading.get_ident()
+                        self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                         return True
                     except Exception as e_win:
                         last_err = e_win
@@ -120,17 +126,25 @@ class FileStorage:
             self._lock_fh = None
             self._plock_impl = None
             self._lock_mode = None
-            self._lock_depth = 0
+            self._lock_depths = {}
         return False
 
     def release_lock(self) -> None:
         """
         Release the process-level lock if held (supports nested acquisitions).
         """
-        if self._lock_depth <= 0:
+        tid = threading.get_ident()
+        d = self._lock_depths.get(tid, 0)
+        if d <= 0:
+            # This thread did not acquire; another thread may still hold the OS lock
             return
-        self._lock_depth -= 1
-        if self._lock_depth > 0:
+        if d > 1:
+            self._lock_depths[tid] = d - 1
+            return
+        else:
+            self._lock_depths.pop(tid, None)
+        # If any other threads still hold, keep OS lock
+        if sum(self._lock_depths.values()) > 0:
             return
         try:
             if self._plock_impl == "fcntl":
@@ -150,7 +164,7 @@ class FileStorage:
                 self._lock_fh = None
                 self._plock_impl = None
                 self._lock_mode = None
-                self._lock_depth = 0
+                self._lock_depths = {}
 
     # ----- Header / schema / taxonomies -----
 
