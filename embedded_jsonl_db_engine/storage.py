@@ -5,7 +5,7 @@ import json
 from typing import Dict, Iterator, Tuple
 import time
 import threading
-from .errors import LockError, IOCorruptionError
+from .errors import IOCorruptionError
 
 HEADER_T = "header"
 SCHEMA_T = "schema"
@@ -88,7 +88,6 @@ class FileStorage:
         self._lock_mode = mode
 
         # Try POSIX flock shared/exclusive first
-        last_err: Exception | None = None
         for _ in range(max(1, int(attempts))):
             try:
                 try:
@@ -102,7 +101,6 @@ class FileStorage:
                     self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                     return True
                 except Exception as e_fcntl:
-                    last_err = e_fcntl
                     # Try Windows fallback
                     try:
                         import msvcrt  # type: ignore
@@ -113,9 +111,9 @@ class FileStorage:
                         self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                         return True
                     except Exception as e_win:
-                        last_err = e_win
+                        pass
             except Exception as e:
-                last_err = e
+                pass
             time.sleep(max(0, int(sleep_ms)) / 1000.0)
 
         # Failed to acquire
