@@ -100,7 +100,7 @@ class FileStorage:
                     tid = threading.get_ident()
                     self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                     return True
-                except Exception as e_fcntl:
+                except Exception:
                     # Try Windows fallback
                     try:
                         import msvcrt  # type: ignore
@@ -110,9 +110,9 @@ class FileStorage:
                         tid = threading.get_ident()
                         self._lock_depths[tid] = self._lock_depths.get(tid, 0) + 1
                         return True
-                    except Exception as e_win:
+                    except Exception:
                         pass
-            except Exception as e:
+            except Exception:
                 pass
             time.sleep(max(0, int(sleep_ms)) / 1000.0)
 
