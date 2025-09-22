@@ -1,6 +1,6 @@
 [project]
 name = "embedded_jsonl_db_engine"
-version = "0.1.0a6"
+version = "0.1.0a7"
 description = "Embedded JSONL DB with strict schema, in-file header (schema+taxonomies), in-memory indexes, and fast regex queries."
 authors = [{ name = "Mykola Rudenko" }]
 requires-python = ">=3.9"
