@@ -1464,8 +1464,9 @@ class Database:
         """
         Create backups: rolling (.bak.N) or daily gz snapshot.
         """
-        keep = int(self.options.backup_rolling_keep)
-        daily_dirname = str(self.options.backup_daily_dir)
+        backup_conf = self._maintenance.get("backup", {}) if isinstance(self._maintenance, dict) else {}
+        keep = int(backup_conf.get("rolling_keep", self.options.backup_rolling_keep))
+        daily_dirname = str(backup_conf.get("daily_dir", self.options.backup_daily_dir))
 
         root_dir_name = str(self.options.backup_root_dir)
         root_dir = os.path.join(os.path.dirname(os.path.abspath(self.path)), root_dir_name)
@@ -1534,7 +1535,7 @@ class Database:
                                     pass
                             self._progress.emit("backup.daily", 100, msg="Daily backup complete", path=dest)
                         # Retention: keep only last N daily backups
-                        daily_keep = int(self.options.backup_daily_keep)
+                        daily_keep = int(backup_conf.get("daily_keep", self.options.backup_daily_keep))
                         try:
                             all_files = sorted(os.listdir(daily_dir))
                             # match files of this DB only
