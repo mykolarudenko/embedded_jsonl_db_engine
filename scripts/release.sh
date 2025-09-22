@@ -21,7 +21,7 @@ info() { echo "[release] $*"; }
 
 # Set release version INSIDE the script (single source of truth for manual releases)
 # To change version, edit the line below and commit:
-VERSION="0.1.0a5"
+VERSION="0.1.0a6"
 
 # Still allow overriding via explicit CLI arg or RELEASE_VERSION env if absolutely needed.
 if [[ $# -gt 1 ]]; then
