@@ -7,6 +7,7 @@ embedded_jsonl_db_engine/database.py
 embedded_jsonl_db_engine/errors.py
 embedded_jsonl_db_engine/fastregex.py
 embedded_jsonl_db_engine/index.py
+embedded_jsonl_db_engine/init.py
 embedded_jsonl_db_engine/progress.py
 embedded_jsonl_db_engine/query.py
 embedded_jsonl_db_engine/schema.py
@@ -20,6 +21,7 @@ embedded_jsonl_db_engine.egg-info/requires.txt
 embedded_jsonl_db_engine.egg-info/top_level.txt
 tests/test_backup_retention.py
 tests/test_corruption.py
+tests/test_locking_concurrency.py
 tests/test_more.py
 tests/test_open.py
 tests/test_performance.py
