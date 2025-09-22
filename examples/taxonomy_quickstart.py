@@ -43,9 +43,23 @@ def main() -> None:
     tags.upsert("old", title="Deprecated")
 
     # Insert sample records
-    r1 = db.new(); r1["name"] = "Post A"; r1["category"] = "news"; r1["tags"] = ["red", "blue"]; r1.save()
-    r2 = db.new(); r2["name"] = "Post B"; r2["category"] = "tech"; r2["tags"] = ["navy"]; r2.save()
-    r3 = db.new(); r3["name"] = "Post C"; r3["category"] = "life"; r3["tags"] = ["old"]; r3.save()
+    r1 = db.new()
+    r1["name"] = "Post A"
+    r1["category"] = "news"
+    r1["tags"] = ["red", "blue"]
+    r1.save()
+
+    r2 = db.new()
+    r2["name"] = "Post B"
+    r2["category"] = "tech"
+    r2["tags"] = ["navy"]
+    r2.save()
+
+    r3 = db.new()
+    r3["name"] = "Post C"
+    r3["category"] = "life"
+    r3["tags"] = ["old"]
+    r3.save()
 
     print("Initial stats (by category):", db.taxonomy("categories").stats())
     print("Initial stats (by tags):", db.taxonomy("tags").stats())
